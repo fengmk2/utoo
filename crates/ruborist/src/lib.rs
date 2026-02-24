@@ -81,9 +81,15 @@ pub mod spec {
     pub use crate::model::spec::{PackageSpec, is_http_tarball_spec};
 }
 
-/// Git clone and resolution types.
+/// Git clone and resolution helpers.
 pub mod git {
     pub use crate::traits::git::GitCloneResult;
+
+    /// Clone a git repository, cache the result, and return metadata.
+    ///
+    /// Only available when the `native-git` feature is enabled.
+    #[cfg(feature = "native-git")]
+    pub use crate::resolver::git::clone_repo;
 }
 
 /// Utility functions.

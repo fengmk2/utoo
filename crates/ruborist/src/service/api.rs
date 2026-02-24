@@ -261,7 +261,8 @@ where
     let config = BuildDepsConfig::default()
         .with_legacy_peer_deps(legacy_peer_deps)
         .with_concurrency(concurrency)
-        .with_skip_preload(skip_preload);
+        .with_skip_preload(skip_preload)
+        .with_cache_dir(cache_dir.clone());
 
     if skip_preload {
         tracing::debug!(
