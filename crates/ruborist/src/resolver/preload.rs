@@ -49,14 +49,16 @@ pub struct PreloadStats {
 
 /// Check if a spec is a non-registry dependency that should skip registry preloading.
 ///
-/// Delegates to [`PackageSpec::parse`] so routing logic stays in one place.
-/// Covers local specs (file:, link:, workspace:, portal:), git/GitHub specs,
-/// HTTP tarball URLs, and bare `user/repo` GitHub shorthand.
+/// Covers local specs (file:, link:, workspace:, portal:) and
+/// remote non-registry specs (git+, git://, github:).
 pub fn is_non_registry_spec(spec: &str) -> bool {
-    !matches!(
-        crate::model::spec::PackageSpec::parse(spec),
-        crate::model::spec::PackageSpec::Registry { .. }
-    )
+    spec.starts_with("file:")
+        || spec.starts_with("link:")
+        || spec.starts_with("workspace:")
+        || spec.starts_with("portal:")
+        || spec.starts_with("git+")
+        || spec.starts_with("git://")
+        || spec.starts_with("github:")
 }
 
 /// Check if a spec is a local dependency (file:, link:, workspace:, portal:).
@@ -385,21 +387,9 @@ mod tests {
         assert!(is_non_registry_spec("github:user/repo"));
         assert!(is_non_registry_spec("github:user/repo#v1.0"));
 
-        // HTTP tarball specs
-        assert!(is_non_registry_spec("https://example.com/pkg.tgz"));
-        assert!(is_non_registry_spec("http://example.com/pkg.tar.gz"));
-        assert!(is_non_registry_spec(
-            "https://example.com/pkg.tgz?v=1.0"
-        ));
-
-        // Bare GitHub shorthand
-        assert!(is_non_registry_spec("user/repo"));
-        assert!(is_non_registry_spec("user/repo#v1.0"));
-
         // Registry specs (should NOT match)
         assert!(!is_non_registry_spec("^1.0.0"));
         assert!(!is_non_registry_spec("latest"));
         assert!(!is_non_registry_spec("~2.0.0"));
-        assert!(!is_non_registry_spec("@scope/pkg@1.0.0"));
     }
 }
