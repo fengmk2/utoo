@@ -1,6 +1,6 @@
 //! Package specification types for different dependency sources.
 //!
-//! Supports registry (semver), git, and GitHub shorthand specs.
+//! Supports registry (semver), git, GitHub shorthand, local, and HTTP tarball specs.
 
 /// Typed representation of a package specification.
 ///
@@ -16,6 +16,12 @@
 ///
 /// let spec = PackageSpec::parse("github:user/repo#v1.0");
 /// assert!(matches!(spec, PackageSpec::GitHub { .. }));
+///
+/// let spec = PackageSpec::parse("file:../local-pkg");
+/// assert!(matches!(spec, PackageSpec::Local { .. }));
+///
+/// let spec = PackageSpec::parse("https://example.com/pkg.tgz");
+/// assert!(matches!(spec, PackageSpec::HttpTarball { .. }));
 /// ```
 #[derive(Debug, Clone, PartialEq)]
 pub enum PackageSpec {
@@ -26,12 +32,16 @@ pub enum PackageSpec {
         url: String,
         commit_ish: Option<String>,
     },
-    /// GitHub shorthand: `github:user/repo#ref`
+    /// GitHub shorthand: `github:user/repo#ref` or bare `user/repo`
     GitHub {
         owner: String,
         repo: String,
         commit_ish: Option<String>,
     },
+    /// Local dependency: `file:`, `link:`, `workspace:`, `portal:`
+    Local { spec: String },
+    /// HTTP tarball URL: `https://example.com/pkg.tgz`
+    HttpTarball { url: String },
 }
 
 impl PackageSpec {
@@ -82,6 +92,39 @@ impl PackageSpec {
                 url: raw.to_string(),
                 commit_ish: commit_ish.map(String::from),
             };
+        }
+
+        // Local specs: file:, link:, workspace:, portal:
+        if raw.starts_with("file:")
+            || raw.starts_with("link:")
+            || raw.starts_with("workspace:")
+            || raw.starts_with("portal:")
+        {
+            return PackageSpec::Local {
+                spec: raw.to_string(),
+            };
+        }
+
+        // HTTP tarball: https://example.com/pkg.tgz
+        if is_http_tarball_spec(raw) {
+            return PackageSpec::HttpTarball {
+                url: raw.to_string(),
+            };
+        }
+
+        // Bare GitHub shorthand: user/repo or user/repo#ref
+        // npm treats "user/repo" (no protocol, not scoped) as github:user/repo
+        if !raw.starts_with('@') && !raw.contains(':') {
+            let (path, commit_ish) = split_fragment(raw);
+            if let Some((owner, repo)) = path.split_once('/') {
+                if !owner.is_empty() && !repo.is_empty() {
+                    return PackageSpec::GitHub {
+                        owner: owner.to_string(),
+                        repo: repo.to_string(),
+                        commit_ish: commit_ish.map(String::from),
+                    };
+                }
+            }
         }
 
         // Default: registry spec — use parse_package_spec for name@version splitting
@@ -242,6 +285,112 @@ mod tests {
         // `github:foo` without `/` is treated as a Git URL, not Registry
         let spec = PackageSpec::parse("github:foo");
         assert!(matches!(spec, PackageSpec::Git { .. }));
+    }
+
+    #[test]
+    fn test_parse_local_file() {
+        assert_eq!(
+            PackageSpec::parse("file:../foo"),
+            PackageSpec::Local {
+                spec: "file:../foo".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_local_link() {
+        assert_eq!(
+            PackageSpec::parse("link:../foo"),
+            PackageSpec::Local {
+                spec: "link:../foo".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_local_workspace() {
+        assert_eq!(
+            PackageSpec::parse("workspace:*"),
+            PackageSpec::Local {
+                spec: "workspace:*".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_local_portal() {
+        assert_eq!(
+            PackageSpec::parse("portal:../foo"),
+            PackageSpec::Local {
+                spec: "portal:../foo".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_http_tarball() {
+        assert_eq!(
+            PackageSpec::parse("https://example.com/pkg.tgz"),
+            PackageSpec::HttpTarball {
+                url: "https://example.com/pkg.tgz".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_http_tarball_with_query() {
+        assert_eq!(
+            PackageSpec::parse("https://example.com/pkg.tgz?v=1.0"),
+            PackageSpec::HttpTarball {
+                url: "https://example.com/pkg.tgz?v=1.0".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_http_tarball_tar_gz() {
+        assert_eq!(
+            PackageSpec::parse("http://example.com/pkg.tar.gz"),
+            PackageSpec::HttpTarball {
+                url: "http://example.com/pkg.tar.gz".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_bare_github_shorthand() {
+        assert_eq!(
+            PackageSpec::parse("user/repo"),
+            PackageSpec::GitHub {
+                owner: "user".to_string(),
+                repo: "repo".to_string(),
+                commit_ish: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_bare_github_shorthand_with_ref() {
+        assert_eq!(
+            PackageSpec::parse("user/repo#develop"),
+            PackageSpec::GitHub {
+                owner: "user".to_string(),
+                repo: "repo".to_string(),
+                commit_ish: Some("develop".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_scoped_not_github() {
+        // Scoped packages must not be confused with bare GitHub shorthand
+        assert_eq!(
+            PackageSpec::parse("@scope/pkg@1.0.0"),
+            PackageSpec::Registry {
+                name: "@scope/pkg".to_string(),
+                version_spec: "1.0.0".to_string(),
+            }
+        );
     }
 
     #[test]
