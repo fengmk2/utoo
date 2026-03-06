@@ -9,6 +9,7 @@ import url from "url";
 import { BundleOptions } from "../config/types";
 import { resolveBundleOptions, WebpackConfig } from "../config/webpackCompat";
 import { createHotReloader } from "../core/hmr";
+import { handleProxyRequest, handleProxyUpgrade } from "../core/proxy";
 import { blockStdout, getPackPath } from "../utils/common";
 import { findRootDir } from "../utils/findRoot";
 import { createSelfSignedCertificate } from "../utils/mkcert";
@@ -381,6 +382,14 @@ export async function initialize(
     res.on("error", console.error);
 
     const handleRequest = async () => {
+      const proxyConfig = bundleOptions.config.devServer?.proxy;
+
+      if (Array.isArray(proxyConfig)) {
+        const handledByProxy = await handleProxyRequest(req, res, proxyConfig);
+        // proxy triggered, return
+        if (handledByProxy) return;
+      }
+
       if (!(req.method === "GET" || req.method === "HEAD")) {
         res.setHeader("Allow", ["GET", "HEAD"]);
         res.statusCode = 405;
@@ -457,9 +466,23 @@ export async function initialize(
 
       if (isHMRRequest) {
         hotReloader.onHMR(req, socket, head);
-      } else {
-        socket.end();
+        return;
       }
+
+      const proxyConfig = bundleOptions.config.devServer?.proxy;
+      if (proxyConfig?.length) {
+        const handledByProxy = await handleProxyUpgrade(
+          req,
+          socket,
+          head,
+          proxyConfig,
+        );
+        if (handledByProxy) {
+          return;
+        }
+      }
+
+      socket.end();
     } catch (err) {
       console.error("Error handling upgrade request", err);
       socket.end();

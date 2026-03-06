@@ -97,6 +97,49 @@ export interface ModuleOptions {
   rules?: Record<string, TurbopackRuleConfigCollection>;
 }
 
+/**
+ * Path rewrite: object form applies first matching regex→replacement;
+ * function form receives path and returns new path (sync only).
+ */
+export type PathRewrite =
+  | { [regexp: string]: string }
+  | ((path: string) => string);
+
+/**
+ * Proxy rule for dev server HTTP/WS proxying.
+ * Mostly aligned with webpack-dev-server / http-proxy-middleware options.
+ */
+export interface ProxyRule {
+  /**
+   * Path(s) to match for proxying.
+   * When starts with `^`, will be treated as RegExp source.
+   * Otherwise, simple prefix match is used.
+   */
+  context: string | string[];
+  /** Target server URL. */
+  target: string;
+  /**
+   * Path rewrite. Object: first matching regex is replaced (http-proxy-middleware style).
+   * Function: (path) => new path.
+   */
+  pathRewrite?: PathRewrite;
+  /**
+   * Whether to change the Host header to match the target.
+   * Defaults to true.
+   */
+  changeOrigin?: boolean;
+  /**
+   * Whether to verify the SSL certificate of the target.
+   * Set to false to accept self-signed certificates.
+   */
+  secure?: boolean;
+}
+
+export type DevServerProxy = ProxyRule[];
+
+/** Object style proxy options without `context`. */
+export type ProxyOptions = Omit<ProxyRule, "context">;
+
 export interface ResolveOptions {
   alias?: Record<string, string | string[] | Record<string, string | string[]>>;
   extensions?: string[];
@@ -231,6 +274,7 @@ export interface ConfigComplete {
     port?: number;
     host?: string;
     https?: boolean;
+    proxy?: DevServerProxy;
   };
   cacheHandler?: string;
   experimental?: ExperimentalConfig;
