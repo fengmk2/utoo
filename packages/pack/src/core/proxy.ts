@@ -97,13 +97,25 @@ export async function handleProxyRequest(
 
   req.url = prepared.rewrittenPath;
 
-  await new Promise<void>((resolve, reject) => {
-    sharedProxy.web(req, res, prepared.options, (err) => {
-      reject(err);
-    });
+  await new Promise<void>((resolve) => {
+    const done = () => resolve();
 
-    res.on("close", () => {
-      resolve();
+    res.on("close", done);
+
+    sharedProxy.web(req, res, prepared.options, (err) => {
+      if (err) {
+        console.error(
+          `[Utoo Pack] Proxy error for ${req.method} ${req.url}:`,
+          err,
+        );
+        if (!res.headersSent) {
+          res.writeHead(502, { "Content-Type": "text/plain" });
+        }
+        if (!res.writableEnded) {
+          res.end(`Proxy error: ${err.message}`);
+        }
+        done();
+      }
     });
   });
 
@@ -128,13 +140,17 @@ export async function handleProxyUpgrade(
 
   req.url = prepared.rewrittenPath;
 
-  await new Promise<void>((resolve, reject) => {
-    sharedProxy.ws(req, socket, head, prepared.options, (err) => {
-      reject(err);
-    });
+  await new Promise<void>((resolve) => {
+    const done = () => resolve();
 
-    socket.on("close", () => {
-      resolve();
+    socket.on("close", done);
+
+    sharedProxy.ws(req, socket, head, prepared.options, (err) => {
+      if (err) {
+        console.error(`[Utoo Pack] Proxy WS error for ${req.url}:`, err);
+        socket.destroy(err);
+        done();
+      }
     });
   });
 
