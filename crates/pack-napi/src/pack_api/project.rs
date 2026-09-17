@@ -184,6 +184,9 @@ pub struct NapiTurboEngineOptions {
     pub turbopack_memory_eviction: Option<MemoryEvictionMode>,
     /// Avoid large backend preallocations to reduce startup memory.
     pub small_preallocation: Option<bool>,
+    /// Run the turbo-tasks reference-counting garbage collector. Defaults to the
+    /// `TURBO_ENGINE_GC` environment variable.
+    pub turbopack_gc: Option<bool>,
     /// Absolute directory for the persistent cache, lock file and traces.
     /// Defaults to `.turbopack` inside the project path.
     pub cache_directory: Option<String>,
@@ -509,6 +512,7 @@ pub fn project_new<'env>(
                 .turbopack_memory_eviction
                 .unwrap_or_else(MemoryEvictionMode::from_env_or_default);
             let small_preallocation = turbo_engine_options.small_preallocation.unwrap_or(false);
+            let turbopack_gc = turbo_engine_options.turbopack_gc;
             let turbo_tasks = create_turbo_tasks(
                 cache_directory,
                 persistent_caching,
@@ -517,6 +521,7 @@ pub fn project_new<'env>(
                 is_short_session,
                 turbopack_memory_eviction.into(),
                 small_preallocation,
+                turbopack_gc,
             )?;
             let turbopack_ctx = TurbopackContext::new(turbo_tasks.clone(), napi_callbacks);
 

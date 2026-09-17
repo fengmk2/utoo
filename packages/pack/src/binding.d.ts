@@ -168,6 +168,11 @@ export interface NapiTurboEngineOptions {
   /** Avoid large backend preallocations to reduce startup memory. */
   smallPreallocation?: boolean
   /**
+   * Run the turbo-tasks reference-counting garbage collector. Defaults to the
+   * `TURBO_ENGINE_GC` environment variable.
+   */
+  turbopackGc?: boolean
+  /**
    * Absolute directory for the persistent cache, lock file and traces.
    * Defaults to `.turbopack` inside the project path.
    */

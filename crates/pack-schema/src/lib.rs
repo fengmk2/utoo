@@ -112,6 +112,11 @@ pub struct CompleteConfig {
     #[schemars(description = "Turbopack memory eviction mode for the persistent cache")]
     pub turbopack_memory_eviction: Option<SchemaTurbopackMemoryEviction>,
 
+    /// Run the turbo-tasks reference-counting garbage collector
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(description = "Run the turbo-tasks reference-counting garbage collector")]
+    pub turbopack_gc: Option<bool>,
+
     /// Cache handler configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(description = "Cache handler configuration")]
@@ -1380,6 +1385,17 @@ mod tests {
         assert!(schema_str.contains("crossOriginLoading"));
         assert!(schema_str.contains("cssFilename"));
         assert!(schema_str.contains("assetModuleFilename"));
+    }
+
+    #[test]
+    fn test_turbopack_gc_schema_is_boolean() {
+        let schema = generate_schema();
+        let gc_type = schema
+            .pointer("/properties/turbopackGc/type")
+            .and_then(serde_json::Value::as_array)
+            .unwrap();
+
+        assert!(gc_type.contains(&serde_json::Value::String("boolean".into())));
     }
 
     #[test]
