@@ -24,11 +24,16 @@ fn tarball(manifest: Value, source: &str) -> Vec<u8> {
     archive.into_inner().unwrap().finish().unwrap()
 }
 
-fn check_tarball_deduplication(dependency_tarball: &str) {
+fn check_tarball_deduplication(
+    dependency_tarball: &str,
+    override_rule: Option<(&str, &str)>,
+    expected_tarball: &str,
+) {
     let mut server = mockito::Server::new();
     let shared_url = format!("{}/shared.tgz", server.url());
     let dependency_url = format!("{}/{dependency_tarball}", server.url());
-    let same_url = dependency_url == shared_url;
+    let expected_url = format!("{}/{expected_tarball}", server.url());
+    let same_url = expected_url == shared_url;
     let shared = tarball(
         json!({ "name": "shared", "version": "1.0.0", "main": "index.js" }),
         "module.exports = new Map();",
@@ -38,6 +43,13 @@ fn check_tarball_deduplication(dependency_tarball: &str) {
         .with_body(&shared)
         .create();
     let _other = server.mock("GET", "/other.tgz").with_body(&shared).create();
+    let _patched = server
+        .mock("GET", "/patched.tgz")
+        .with_body(tarball(
+            json!({ "name": "shared", "version": "1.0.0", "main": "index.js" }),
+            "module.exports = new Map([['patched', true]]);",
+        ))
+        .create();
     let _consumer = server
         .mock("GET", "/consumer.tgz")
         .with_body(tarball(
@@ -50,18 +62,19 @@ fn check_tarball_deduplication(dependency_tarball: &str) {
         .create();
     let project = tempdir().unwrap();
     let cache = tempdir().unwrap();
-    fs::write(
-        project.path().join("package.json"),
-        json!({
-            "name": "http-dedup", "version": "1.0.0", "private": true,
-            "dependencies": {
-                "shared": shared_url,
-                "consumer": format!("{}/consumer.tgz", server.url())
-            }
-        })
-        .to_string(),
-    )
-    .unwrap();
+    let mut manifest = json!({
+        "name": "http-dedup", "version": "1.0.0", "private": true,
+        "dependencies": {
+            "shared": shared_url,
+            "consumer": format!("{}/consumer.tgz", server.url())
+        }
+    });
+    if let Some((spec, target)) = override_rule {
+        manifest["overrides"] = json!({
+            "consumer": { (spec): format!("{}/{target}", server.url()) }
+        });
+    }
+    fs::write(project.path().join("package.json"), manifest.to_string()).unwrap();
 
     // Check both fresh resolution and installation from the generated lockfile.
     for reinstall in [false, true] {
@@ -89,7 +102,7 @@ fn check_tarball_deduplication(dependency_tarball: &str) {
         assert_eq!(packages.contains_key(nested), !same_url);
         assert_eq!(project.path().join(nested).exists(), !same_url);
         if !same_url {
-            assert_eq!(packages[nested]["resolved"], dependency_url);
+            assert_eq!(packages[nested]["resolved"], expected_url);
         }
 
         let output = Command::new("node")
@@ -101,12 +114,16 @@ fn check_tarball_deduplication(dependency_tarball: &str) {
                 const shared = require("shared");
                 const consumer = require("consumer");
                 const expectShared = process.argv[1] === "true";
+                const expectPatched = process.argv[2] === "true";
                 shared.set("example", 42);
                 assert.equal(consumer === shared, expectShared);
                 assert.equal(consumer.get("example"), expectShared ? 42 : undefined);
+                assert.equal(consumer.get("patched"), expectPatched ? true : undefined);
+                assert.equal(shared.get("patched"), undefined);
                 "#,
             ])
             .arg(same_url.to_string())
+            .arg((expected_tarball == "patched.tgz").to_string())
             .output()
             .unwrap();
         assert!(output.status.success(), "{output:?}");
@@ -115,10 +132,42 @@ fn check_tarball_deduplication(dependency_tarball: &str) {
 
 #[test]
 fn identical_http_tarballs_share_module_state() {
-    check_tarball_deduplication("shared.tgz");
+    check_tarball_deduplication("shared.tgz", None, "shared.tgz");
 }
 
 #[test]
 fn different_http_tarballs_with_same_version_stay_separate() {
-    check_tarball_deduplication("other.tgz");
+    check_tarball_deduplication("other.tgz", None, "other.tgz");
+}
+
+#[test]
+fn conditional_override_prevents_http_tarball_reuse() {
+    check_tarball_deduplication(
+        "shared.tgz",
+        Some(("shared@^1.0.0", "patched.tgz")),
+        "patched.tgz",
+    );
+}
+
+#[test]
+fn nonmatching_conditional_override_allows_http_tarball_reuse() {
+    check_tarball_deduplication(
+        "shared.tgz",
+        Some(("shared@^2.0.0", "patched.tgz")),
+        "shared.tgz",
+    );
+}
+
+#[test]
+fn conditional_override_to_same_url_allows_http_tarball_reuse() {
+    check_tarball_deduplication(
+        "shared.tgz",
+        Some(("shared@^1.0.0", "shared.tgz")),
+        "shared.tgz",
+    );
+}
+
+#[test]
+fn unconditional_override_prevents_http_tarball_reuse() {
+    check_tarball_deduplication("shared.tgz", Some(("shared", "patched.tgz")), "patched.tgz");
 }
