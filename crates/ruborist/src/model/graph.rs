@@ -1,6 +1,5 @@
 //! Dependency graph data structure using petgraph.
 
-use deno_semver::VersionReq;
 use petgraph::Direction::{Incoming, Outgoing};
 use petgraph::graph::{DiGraph, EdgeIndex, NodeIndex};
 use petgraph::visit::EdgeRef;
@@ -13,8 +12,7 @@ use super::manifest::{CoreVersionManifest, NodeManifest};
 use super::node::{EdgeType, NodeType};
 use super::override_rule::Overrides;
 use super::package_json::PackageJson;
-use crate::resolver::semver::{matches, normalize_spec};
-use crate::spec::Protocol;
+use crate::resolver::matching;
 
 /// Package node in the dependency graph.
 #[derive(Debug, Clone)]
@@ -595,33 +593,13 @@ impl DependencyGraph {
         // Start with the requester's own node_modules, including nested nodes
         // seeded from a lockfile, before looking in ancestor directories.
         self.find_in_parent_chain(from, name, |child| {
-            let spec = effective_spec.as_str();
-            let matches_candidate = |spec: &str| match Protocol::strip_prefix(spec) {
-                // HTTP tarballs are identified by their source URL, not the
-                // version declared in their package.json.
-                Some((Protocol::Http, _)) => child
-                    .manifest
-                    .dist()
-                    .is_some_and(|dist| dist.tarball.as_deref() == Some(spec)),
-                _ => matches(spec, &child.version),
-            };
             // Compare the selected target with the package, not the requested
             // spec: a range and an exact version can select the same package.
-            matches_candidate(spec)
+            matching::matches_spec(child, &effective_spec)
                 && self
                     .check_override(from, name, Some(&child.version))
-                    .is_none_or(|target| match Protocol::strip_prefix(&target) {
-                        Some((Protocol::Http, _)) => matches_candidate(&target),
-                        None | Some((Protocol::NpmAlias, _)) => {
-                            let (target_name, target_range) = normalize_spec(name, &target);
-                            child.manifest.name() == target_name
-                                && VersionReq::parse_from_npm(&target_range).is_ok_and(|req| {
-                                    // A dist-tag needs registry resolution;
-                                    // the candidate's version cannot identify it.
-                                    req.tag().is_none() && matches(&target_range, &child.version)
-                                })
-                        }
-                        _ => target == spec,
+                    .is_none_or(|target| {
+                        matching::matches_override_target(child, name, &effective_spec, &target)
                     })
         })
     }
@@ -635,12 +613,7 @@ impl DependencyGraph {
         manifest: &CoreVersionManifest,
     ) -> FindResult {
         self.find_in_parent_chain(from, name, |child| {
-            child.manifest.name() == manifest.name
-                && child.version == manifest.version
-                && child
-                    .manifest
-                    .dist()
-                    .is_some_and(|dist| dist.tarball == manifest.dist.tarball)
+            matching::matches_resolved_manifest(child, manifest)
         })
     }
 

@@ -32,6 +32,7 @@ pub mod file;
 pub mod git;
 #[cfg(feature = "http-tarball")]
 pub mod http;
+pub(crate) mod matching;
 pub mod node_types;
 pub mod placement;
 pub mod registry;
