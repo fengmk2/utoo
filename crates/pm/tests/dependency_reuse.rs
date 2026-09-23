@@ -1,5 +1,7 @@
 use std::fs;
+use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
 
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -170,4 +172,158 @@ fn conditional_override_to_same_url_allows_http_tarball_reuse() {
 #[test]
 fn unconditional_override_prevents_http_tarball_reuse() {
     check_tarball_deduplication("shared.tgz", Some(("shared", "patched.tgz")), "patched.tgz");
+}
+
+fn registry_package(
+    server: &mut mockito::Server,
+    name: &str,
+    dependencies: Value,
+    source: &str,
+) -> Vec<mockito::Mock> {
+    let manifest = json!({
+        "name": name, "version": "1.0.0", "main": "index.js",
+        "dependencies": dependencies,
+        "dist": { "tarball": format!("{}/{name}.tgz", server.url()) }
+    });
+    vec![
+        server
+            .mock("GET", format!("/{name}").as_str())
+            .with_body(
+                json!({
+                    "name": name, "dist-tags": { "latest": "1.0.0" },
+                    "versions": { "1.0.0": manifest }
+                })
+                .to_string(),
+            )
+            .create(),
+        server
+            .mock("GET", format!("/{name}/1.0.0").as_str())
+            .with_body(manifest.to_string())
+            .create(),
+        server
+            .mock("GET", format!("/{name}.tgz").as_str())
+            .with_body(tarball(manifest, source))
+            .create(),
+    ]
+}
+
+async fn run_utoo(project: &Path, cache: &Path, registry: &str, args: &[&str]) -> Value {
+    // A reuse regression can expand a dependency cycle forever. Kill the child
+    // on timeout so a failing test cannot hang the test runner or leave it running.
+    let output = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_utoo"))
+            .current_dir(project)
+            .env("UTOO_CACHE_DIR", cache)
+            .env("NO_UPDATE_NOTIFIER", "1")
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost")
+            .args(args)
+            .args(["--registry", registry])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .expect("dependency resolution did not terminate")
+    .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    serde_json::from_slice(&fs::read(project.join("package-lock.json")).unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn compatible_conditional_override_shares_module_state() {
+    let mut server = mockito::Server::new_async().await;
+    let _shared = registry_package(
+        &mut server,
+        "shared",
+        json!({}),
+        "module.exports = new Map();",
+    );
+    let _first = registry_package(
+        &mut server,
+        "first",
+        json!({ "shared": "^1.0.0" }),
+        "module.exports = require('shared');",
+    );
+    let _second = registry_package(
+        &mut server,
+        "second",
+        json!({ "shared": "^1.0.0" }),
+        "module.exports = require('shared');",
+    );
+    let project = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    fs::write(
+        project.path().join("package.json"),
+        json!({
+            "name": "root", "version": "1.0.0", "private": true,
+            "dependencies": { "first": "1.0.0", "second": "1.0.0" },
+            "overrides": { "shared@^1.0.0": "1.0.0" }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    for reinstall in [false, true] {
+        if reinstall {
+            fs::remove_dir_all(project.path().join("node_modules")).unwrap();
+        }
+        let lock = run_utoo(
+            project.path(),
+            cache.path(),
+            &server.url(),
+            &["install", "--ignore-scripts"],
+        )
+        .await;
+        assert_eq!(lock["packages"].as_object().unwrap().len(), 4);
+        assert_eq!(lock["packages"]["node_modules/shared"]["version"], "1.0.0");
+
+        let output = Command::new("node")
+            .current_dir(project.path())
+            .args([
+                "-e",
+                r#"
+                const assert = require("node:assert/strict");
+                const first = require("first");
+                const second = require("second");
+                first.set("example", 42);
+                assert.equal(first, second);
+                assert.equal(second.get("example"), 42);
+            "#,
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+}
+
+#[tokio::test]
+async fn compatible_conditional_overrides_close_dependency_cycles() {
+    let mut server = mockito::Server::new_async().await;
+    let _a = registry_package(&mut server, "cycle-a", json!({ "cycle-b": "^1.0.0" }), "");
+    let _b = registry_package(&mut server, "cycle-b", json!({ "cycle-a": "^1.0.0" }), "");
+    let project = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    fs::write(
+        project.path().join("package.json"),
+        json!({
+            "name": "root", "version": "1.0.0", "private": true,
+            "dependencies": { "cycle-a": "1.0.0" },
+            "overrides": { "cycle-a@^1.0.0": "1.0.0", "cycle-b@^1.0.0": "1.0.0" }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // Resolve both with and without an existing lockfile.
+    for _ in 0..2 {
+        let lock = run_utoo(project.path(), cache.path(), &server.url(), &["deps"]).await;
+        let packages = lock["packages"].as_object().unwrap();
+        assert_eq!(packages.len(), 3);
+        for (name, dependency) in [("cycle-a", "cycle-b"), ("cycle-b", "cycle-a")] {
+            let package = &packages[&format!("node_modules/{name}")];
+            assert_eq!(package["version"], "1.0.0");
+            assert_eq!(package["dependencies"][dependency], "^1.0.0");
+        }
+    }
 }

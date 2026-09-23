@@ -1,5 +1,6 @@
 //! Dependency graph data structure using petgraph.
 
+use deno_semver::VersionReq;
 use petgraph::Direction::{Incoming, Outgoing};
 use petgraph::graph::{DiGraph, EdgeIndex, NodeIndex};
 use petgraph::visit::EdgeRef;
@@ -12,7 +13,7 @@ use super::manifest::{CoreVersionManifest, NodeManifest};
 use super::node::{EdgeType, NodeType};
 use super::override_rule::Overrides;
 use super::package_json::PackageJson;
-use crate::resolver::semver::matches;
+use crate::resolver::semver::{matches, normalize_spec};
 use crate::spec::Protocol;
 
 /// Package node in the dependency graph.
@@ -608,7 +609,7 @@ impl DependencyGraph {
         // linear scan over every physical child per ancestor level.
         if let Some(child_idx) = self.find_physical_child(current, name) {
             let child = &self.graph[child_idx];
-            let compatible = match Protocol::strip_prefix(spec) {
+            let matches_candidate = |spec: &str| match Protocol::strip_prefix(spec) {
                 // HTTP tarballs are identified by their source URL, not the
                 // version declared in their package.json.
                 Some((Protocol::Http, _)) => child
@@ -617,12 +618,25 @@ impl DependencyGraph {
                     .is_some_and(|dist| dist.tarball.as_deref() == Some(spec)),
                 _ => matches(spec, &child.version),
             };
-            // Reuse must not bypass a conditional override. A different target
-            // needs the normal override resolver, even when the spec matches.
-            if compatible
+            // Compare the selected target with the package, not the requested
+            // spec: a range and an exact version can select the same package.
+            if matches_candidate(spec)
                 && self
                     .check_override(requester, name, Some(&child.version))
-                    .is_none_or(|target| target == spec)
+                    .is_none_or(|target| match Protocol::strip_prefix(&target) {
+                        Some((Protocol::Http, _)) => matches_candidate(&target),
+                        None | Some((Protocol::NpmAlias, _)) => {
+                            let (target_name, target_range) = normalize_spec(name, &target);
+                            child.manifest.name() == target_name
+                                && VersionReq::parse_from_npm(&target_range).is_ok_and(|req| {
+                                    // A changed dist-tag needs registry resolution;
+                                    // the candidate's version cannot identify it.
+                                    (req.tag().is_none() || target == spec)
+                                        && matches(&target_range, &child.version)
+                                })
+                        }
+                        _ => target == spec,
+                    })
             {
                 return FindResult::Reuse(child_idx);
             }
@@ -866,6 +880,58 @@ mod tests {
         // Should find conflict when spec doesn't match
         let result = graph.find_compatible_node(graph.root_index, "lodash", "^4.17.0");
         assert_eq!(result, FindResult::Conflict(graph.root_index));
+    }
+
+    #[test]
+    fn test_conditional_override_matches_candidate_version_and_source() {
+        let url = "https://registry.example.com/shared-1.0.0.tgz";
+        for (target, manifest_name, resolved, can_reuse) in [
+            ("1.0.0", "shared", Some(url), true),
+            ("~1.0.0", "shared", Some(url), true),
+            ("2.0.0", "shared", Some(url), false),
+            ("npm:shared@1.0.0", "shared", Some(url), true),
+            ("npm:patched@1.0.0", "shared", Some(url), false),
+            ("npm:@scope/shared@1.0.0", "@scope/shared", Some(url), true),
+            ("latest", "shared", Some(url), false),
+            (url, "shared", Some(url), true),
+            (
+                "https://example.com/patched.tgz",
+                "shared",
+                Some(url),
+                false,
+            ),
+            (url, "shared", None, false),
+        ] {
+            let pkg = PackageJson::from_value(&serde_json::json!({
+                "name": "root", "version": "1.0.0",
+                "overrides": { "shared@^1.0.0": target }
+            }))
+            .unwrap();
+            let mut graph = DependencyGraph::from_package_json(PathBuf::from("."), pkg);
+            let mut manifest = CoreVersionManifest {
+                name: manifest_name.to_string(),
+                version: "1.0.0".to_string(),
+                ..Default::default()
+            };
+            manifest.dist.tarball = resolved.map(str::to_string);
+            let shared = graph.add_node(PackageNode::from_version_manifest(
+                "shared".to_string(),
+                PathBuf::from("node_modules/shared"),
+                Arc::new(manifest),
+            ));
+            graph.add_physical_edge(graph.root_index, shared);
+
+            let expected = if can_reuse {
+                FindResult::Reuse(shared)
+            } else {
+                FindResult::Conflict(graph.root_index)
+            };
+            assert_eq!(
+                graph.find_compatible_node(graph.root_index, "shared", "^1.0.0"),
+                expected,
+                "override {target}, candidate {manifest_name}@1.0.0 from {resolved:?}",
+            );
+        }
     }
 
     #[test]
