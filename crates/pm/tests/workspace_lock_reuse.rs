@@ -168,3 +168,113 @@ fn changed_conditional_overrides_replace_locked_workspace_dependency() {
         );
     }
 }
+
+#[test]
+fn unchanged_dist_tag_override_preserves_locked_version() {
+    for (selector, requirement, first_version, next_version) in [
+        ("shared", "latest", "1.0.0", "2.0.0"),
+        ("shared@^1.0.0", "latest", "1.0.0", "2.0.0"),
+        ("shared@^1.0.0", "1.0.0", "2.0.0", "3.0.0"),
+    ] {
+        let mut server = mockito::Server::new();
+        let mut versions = json!({});
+        let mut version_mocks = Vec::new();
+        for version in ["1.0.0", "2.0.0", "3.0.0"] {
+            let manifest = json!({
+                "name": "shared", "version": version,
+                "dist": { "tarball": format!("{}/shared-{version}.tgz", server.url()) }
+            });
+            version_mocks.push(
+                server
+                    .mock("GET", format!("/shared/{version}").as_str())
+                    .with_body(manifest.to_string())
+                    .create(),
+            );
+            versions[version] = manifest;
+        }
+        let mut packument = json!({
+            "name": "shared", "dist-tags": { "latest": first_version, "next": next_version },
+            "versions": versions
+        });
+        let initial_metadata = server
+            .mock("GET", "/shared")
+            .with_body(packument.to_string())
+            .create();
+        let project = tempdir().unwrap();
+        let root = json!({
+            "name": "root", "version": "1.0.0", "private": true,
+            "dependencies": { "shared": requirement },
+            "overrides": { (selector): "latest" }
+        });
+        fs::write(project.path().join("package.json"), root.to_string()).unwrap();
+        let initial =
+            resolve_dependencies(project.path(), tempdir().unwrap().path(), &server.url());
+        assert_eq!(
+            initial["packages"]["node_modules/shared"]["version"],
+            first_version
+        );
+        initial_metadata.remove();
+        for mock in &version_mocks {
+            mock.remove();
+        }
+
+        packument["dist-tags"]["latest"] = json!(next_version);
+        let moved_metadata = server
+            .mock("GET", "/shared")
+            .with_body(packument.to_string())
+            .expect(0)
+            .create();
+        let version_metadata = server
+            .mock("GET", mockito::Matcher::Regex("^/shared/".into()))
+            .with_status(500)
+            .expect(0)
+            .create();
+        // A fresh cache must not turn an unchanged lock into a tag update.
+        let locked = resolve_dependencies(project.path(), tempdir().unwrap().path(), &server.url());
+        assert_eq!(
+            locked, initial,
+            "unchanged {selector} override must retain its lock"
+        );
+        moved_metadata.assert();
+        version_metadata.assert();
+        moved_metadata.remove();
+        version_metadata.remove();
+
+        for (version, manifest) in versions.as_object().unwrap() {
+            version_mocks.push(
+                server
+                    .mock("GET", format!("/shared/{version}").as_str())
+                    .with_body(manifest.to_string())
+                    .create(),
+            );
+        }
+        // Either a changed requirement or a changed override must resolve again.
+        for field in ["dependencies", "overrides"] {
+            let changed_metadata = server
+                .mock("GET", "/shared")
+                .with_body(packument.to_string())
+                .expect_at_least(1)
+                .create();
+            let mut changed_root = root.clone();
+            changed_root[field] = json!({ "shared": "next" });
+            fs::write(
+                project.path().join("package.json"),
+                changed_root.to_string(),
+            )
+            .unwrap();
+            fs::write(
+                project.path().join("package-lock.json"),
+                initial.to_string(),
+            )
+            .unwrap();
+            let changed =
+                resolve_dependencies(project.path(), tempdir().unwrap().path(), &server.url());
+            assert_eq!(
+                changed["packages"]["node_modules/shared"]["version"], next_version,
+                "changed {field}"
+            );
+            changed_metadata.assert();
+            changed_metadata.remove();
+        }
+    }
+}
