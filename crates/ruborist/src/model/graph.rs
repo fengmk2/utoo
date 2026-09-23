@@ -591,11 +591,9 @@ impl DependencyGraph {
             version_spec.to_string()
         };
 
-        // Get physical parent of from node, default to from if it's the root
-        let parent = self.get_physical_parent(from).unwrap_or(from);
-
-        // Recursively search up the parent chain
-        self.find_in_parent_chain(parent, name, &effective_spec, from)
+        // Start with the requester's own node_modules, including nested nodes
+        // seeded from a lockfile, before looking in ancestor directories.
+        self.find_in_parent_chain(from, name, &effective_spec, from)
     }
 
     /// Recursively search for compatible node in parent chain.
@@ -898,5 +896,25 @@ mod tests {
         // From express, should find lodash in parent (root)
         let result = graph.find_compatible_node(express_idx, "lodash", "^4.17.0");
         assert_eq!(result, FindResult::Reuse(lodash_idx));
+
+        let nested_idx = graph.add_node(PackageNode::from_version_manifest(
+            "lodash".to_string(),
+            PathBuf::from("node_modules/express/node_modules/lodash"),
+            create_version_manifest("lodash", "3.10.1"),
+        ));
+        graph.add_physical_edge(express_idx, nested_idx);
+
+        // The nested copy wins even when an ancestor also satisfies the range.
+        for spec in ["^3.0.0", "*"] {
+            assert_eq!(
+                graph.find_compatible_node(express_idx, "lodash", spec),
+                FindResult::Reuse(nested_idx)
+            );
+        }
+        // An incompatible nested copy hides the otherwise compatible ancestor.
+        assert_eq!(
+            graph.find_compatible_node(express_idx, "lodash", "^4.17.0"),
+            FindResult::Conflict(express_idx)
+        );
     }
 }
