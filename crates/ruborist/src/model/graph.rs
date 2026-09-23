@@ -658,7 +658,9 @@ impl DependencyGraph {
             // linear scan over every physical child per ancestor level.
             if let Some(child_idx) = self.find_physical_child(current, name) {
                 let child = &self.graph[child_idx];
-                if matches_candidate(child) {
+                if matches_candidate(child)
+                    && self.has_compatible_descendant_overrides(from, child_idx)
+                {
                     return FindResult::Reuse(child_idx);
                 }
                 tracing::debug!(

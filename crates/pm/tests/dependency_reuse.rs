@@ -355,3 +355,103 @@ async fn compatible_conditional_overrides_close_dependency_cycles() {
 async fn conditional_dist_tag_overrides_close_dependency_cycles() {
     check_conditional_overrides_close_dependency_cycles("latest").await;
 }
+
+#[tokio::test]
+async fn http_reuse_preserves_descendant_overrides() {
+    let mut server = mockito::Server::new_async().await;
+    let shared_url = format!("{}/shared.tgz", server.url());
+    let _shared = server
+        .mock("GET", "/shared.tgz")
+        .with_body(tarball(
+            json!({
+                "name": "shared", "version": "1.0.0", "main": "index.js",
+                "dependencies": { "inner": "1.0.0" }
+            }),
+            "module.exports = require('inner');",
+        ))
+        .create();
+    let _consumer = server
+        .mock("GET", "/consumer.tgz")
+        .with_body(tarball(
+            json!({
+                "name": "consumer", "version": "1.0.0", "main": "index.js",
+                "dependencies": { "shared": shared_url }
+            }),
+            "module.exports = require('shared');",
+        ))
+        .create();
+    let mut versions = json!({});
+    let mut inner_mocks = Vec::new();
+    for version in ["1.0.0", "2.0.0"] {
+        let manifest = json!({
+            "name": "inner", "version": version, "main": "index.js",
+            "dist": { "tarball": format!("{}/inner-{version}.tgz", server.url()) }
+        });
+        inner_mocks.push(
+            server
+                .mock("GET", format!("/inner/{version}").as_str())
+                .with_body(manifest.to_string())
+                .create(),
+        );
+        inner_mocks.push(
+            server
+                .mock("GET", format!("/inner-{version}.tgz").as_str())
+                .with_body(tarball(
+                    manifest.clone(),
+                    &format!("module.exports = '{version}';"),
+                ))
+                .create(),
+        );
+        versions[version] = manifest;
+    }
+    let _inner = server
+        .mock("GET", "/inner")
+        .with_body(
+            json!({
+                "name": "inner", "dist-tags": { "latest": "2.0.0" }, "versions": versions
+            })
+            .to_string(),
+        )
+        .create();
+    let project = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    fs::write(
+        project.path().join("package.json"),
+        json!({
+            "name": "root", "version": "1.0.0", "private": true,
+            "dependencies": {
+                "shared": shared_url,
+                "consumer": format!("{}/consumer.tgz", server.url())
+            },
+            "overrides": { "consumer": { "shared": { "inner": "2.0.0" } } }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    for reinstall in [false, true] {
+        if reinstall {
+            fs::remove_dir_all(project.path().join("node_modules")).unwrap();
+        }
+        run_utoo(
+            project.path(),
+            cache.path(),
+            &server.url(),
+            &["install", "--ignore-scripts"],
+        )
+        .await;
+        let output = Command::new("node")
+            .current_dir(project.path())
+            .args([
+                "-e",
+                r#"
+                const assert = require("node:assert/strict");
+                assert.equal(require("consumer"), "2.0.0");
+                assert.equal(require("shared"), "1.0.0");
+            "#,
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+}
