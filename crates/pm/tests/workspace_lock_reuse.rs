@@ -48,9 +48,6 @@ fn workspace_nested_dependency_preserves_locked_metadata() {
         workspace.to_string(),
     )
     .unwrap();
-    let nested = json!({
-        "name": "shared", "version": "2.0.0", "resolved": resolved
-    });
     let baseline = json!({
         "name": "root", "version": "1.0.0", "lockfileVersion": 3, "requires": true,
         "packages": {
@@ -61,7 +58,9 @@ fn workspace_nested_dependency_preserves_locked_metadata() {
                 "name": "shared", "version": "1.0.0",
                 "resolved": format!("{}/shared-1.0.0.tgz", server.url())
             },
-            "packages/app/node_modules/shared": nested
+            "packages/app/node_modules/shared": {
+                "name": "shared", "version": "2.0.0", "resolved": resolved
+            }
         }
     });
     fs::write(
