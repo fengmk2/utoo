@@ -1,5 +1,4 @@
 use std::fs;
-use std::io::Write;
 use std::process::Command;
 
 use flate2::Compression;
@@ -8,7 +7,8 @@ use serde_json::{Value, json};
 use tempfile::tempdir;
 
 fn tarball(manifest: Value, source: &str) -> Vec<u8> {
-    let mut archive = tar::Builder::new(Vec::new());
+    let gzip = GzEncoder::new(Vec::new(), Compression::default());
+    let mut archive = tar::Builder::new(gzip);
     for (path, body) in [
         ("package/package.json", manifest.to_string()),
         ("package/index.js", source.to_string()),
@@ -21,19 +21,14 @@ fn tarball(manifest: Value, source: &str) -> Vec<u8> {
             .append_data(&mut header, path, body.as_bytes())
             .unwrap();
     }
-    let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
-    gzip.write_all(&archive.into_inner().unwrap()).unwrap();
-    gzip.finish().unwrap()
+    archive.into_inner().unwrap().finish().unwrap()
 }
 
-fn check_shared_tarball(different_url: bool) {
+fn check_tarball_deduplication(dependency_tarball: &str) {
     let mut server = mockito::Server::new();
     let shared_url = format!("{}/shared.tgz", server.url());
-    let dependency_url = if different_url {
-        format!("{}/other.tgz", server.url())
-    } else {
-        shared_url.clone()
-    };
+    let dependency_url = format!("{}/{dependency_tarball}", server.url());
+    let same_url = dependency_url == shared_url;
     let shared = tarball(
         json!({ "name": "shared", "version": "1.0.0", "main": "index.js" }),
         "module.exports = new Map();",
@@ -88,12 +83,12 @@ fn check_shared_tarball(different_url: bool) {
             serde_json::from_slice(&fs::read(project.path().join("package-lock.json")).unwrap())
                 .unwrap();
         let packages = lock["packages"].as_object().unwrap();
-        assert_eq!(packages.len(), if different_url { 4 } else { 3 });
+        assert_eq!(packages.len(), if same_url { 3 } else { 4 });
         assert_eq!(packages["node_modules/shared"]["resolved"], shared_url);
         let nested = "node_modules/consumer/node_modules/shared";
-        assert_eq!(packages.contains_key(nested), different_url);
-        assert_eq!(project.path().join(nested).exists(), different_url);
-        if different_url {
+        assert_eq!(packages.contains_key(nested), !same_url);
+        assert_eq!(project.path().join(nested).exists(), !same_url);
+        if !same_url {
             assert_eq!(packages[nested]["resolved"], dependency_url);
         }
 
@@ -101,17 +96,17 @@ fn check_shared_tarball(different_url: bool) {
             .current_dir(project.path())
             .args([
                 "-e",
-                &format!(
-                    "const assert = require('node:assert/strict');
-                     const shared = require('shared');
-                     const consumer = require('consumer');
-                     shared.set('example', 42);
-                     assert.equal(consumer === shared, {});
-                     assert.equal(consumer.get('example'), {});",
-                    !different_url,
-                    if different_url { "undefined" } else { "42" }
-                ),
+                r#"
+                const assert = require("node:assert/strict");
+                const shared = require("shared");
+                const consumer = require("consumer");
+                const expectShared = process.argv[1] === "true";
+                shared.set("example", 42);
+                assert.equal(consumer === shared, expectShared);
+                assert.equal(consumer.get("example"), expectShared ? 42 : undefined);
+                "#,
             ])
+            .arg(same_url.to_string())
             .output()
             .unwrap();
         assert!(output.status.success(), "{output:?}");
@@ -120,10 +115,10 @@ fn check_shared_tarball(different_url: bool) {
 
 #[test]
 fn identical_http_tarballs_share_module_state() {
-    check_shared_tarball(false);
+    check_tarball_deduplication("shared.tgz");
 }
 
 #[test]
 fn different_http_tarballs_with_same_version_stay_separate() {
-    check_shared_tarball(true);
+    check_tarball_deduplication("other.tgz");
 }

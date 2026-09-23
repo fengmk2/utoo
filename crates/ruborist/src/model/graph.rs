@@ -611,13 +611,10 @@ impl DependencyGraph {
             let compatible = match Protocol::strip_prefix(spec) {
                 // HTTP tarballs are identified by their source URL, not the
                 // version declared in their package.json.
-                Some((Protocol::Http, _)) => {
-                    child
-                        .manifest
-                        .dist()
-                        .and_then(|dist| dist.tarball.as_deref())
-                        == Some(spec)
-                }
+                Some((Protocol::Http, _)) => child
+                    .manifest
+                    .dist()
+                    .is_some_and(|dist| dist.tarball.as_deref() == Some(spec)),
                 _ => matches(spec, &child.version),
             };
             if compatible {
@@ -803,7 +800,12 @@ mod tests {
             "http://example.com/shared.tgz",
             "https://pkg.pr.new/shared@commit",
         ] {
-            for resolved in [Some(url.to_string()), Some(format!("{url}?other")), None] {
+            let other_url = format!("{url}?other");
+            for (resolved, can_reuse) in [
+                (Some(url), true),
+                (Some(other_url.as_str()), false),
+                (None, false),
+            ] {
                 let mut graph = DependencyGraph::from_package_json(
                     PathBuf::from("."),
                     create_pkg("root", "1.0.0"),
@@ -813,7 +815,7 @@ mod tests {
                     version: "1.0.0".to_string(),
                     ..Default::default()
                 };
-                manifest.dist.tarball = resolved.clone();
+                manifest.dist.tarball = resolved.map(str::to_string);
                 let shared = graph.add_node(PackageNode::from_version_manifest(
                     "shared".to_string(),
                     PathBuf::from("node_modules/shared"),
@@ -827,7 +829,7 @@ mod tests {
                 ));
                 graph.add_physical_edge(graph.root_index, consumer);
 
-                let expected = if resolved.as_deref() == Some(url) {
+                let expected = if can_reuse {
                     FindResult::Reuse(shared)
                 } else {
                     FindResult::Conflict(consumer)
