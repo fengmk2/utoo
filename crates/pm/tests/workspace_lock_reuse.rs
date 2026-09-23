@@ -144,6 +144,7 @@ fn changed_conditional_overrides_replace_locked_workspace_dependency() {
     for (selector, target, expected) in [
         ("shared@^9.0.0", "3.0.0", "2.0.0"),
         ("shared@^2.0.0", "2.0.0", "2.0.0"),
+        ("shared@^2.0.0", "latest", "4.0.0"),
         ("shared@^2.0.0", "3.0.0", "3.0.0"),
         ("shared@^2.0.0", "4.0.0", "4.0.0"),
     ] {

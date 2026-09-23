@@ -99,8 +99,7 @@ use super::file::process_file_dep;
 pub use super::node_types::{compute_node_types, update_node_type_from_edge};
 pub use super::placement::process_dependency_with_resolved;
 pub(crate) use super::placement::{
-    chain_err, handle_resolved_registry_manifest, place_new_node, reuse_existing_node,
-    try_reuse_dependency,
+    chain_err, handle_resolved_registry_manifest, reuse_existing_node, try_reuse_dependency,
 };
 pub use crate::model::node::{DevDeps, PeerDeps};
 
@@ -413,7 +412,7 @@ pub async fn process_dependency<R: ManifestProvider>(
                     }
                     #[cfg(not(feature = "http-tarball"))]
                     {
-                        let _ = path;
+                        let _ = (path, conflict_parent);
                         return Err(ResolveError::Unsupported {
                             spec: edge_info.spec.clone(),
                             reason: "file:/link:/portal: deps require the 'http-tarball' feature",
@@ -478,12 +477,8 @@ pub async fn process_dependency<R: ManifestProvider>(
                 None => resolved,
             };
 
-            Ok(place_new_node(
-                graph,
-                conflict_parent,
-                edge_info,
-                &resolved,
-                config,
+            Ok(process_dependency_with_resolved(
+                graph, node_index, edge_info, &resolved, config,
             ))
         }
     }
