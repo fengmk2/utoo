@@ -1,8 +1,23 @@
 use std::fs;
+use std::path::Path;
 use std::process::Command;
 
 use serde_json::{Value, json};
 use tempfile::tempdir;
+
+fn resolve_dependencies(project: &Path, cache: &Path, registry: &str) -> Value {
+    let output = Command::new(env!("CARGO_BIN_EXE_utoo"))
+        .current_dir(project)
+        .env("UTOO_CACHE_DIR", cache)
+        .env("NO_UPDATE_NOTIFIER", "1")
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
+        .args(["deps", "--registry", registry])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    serde_json::from_slice(&fs::read(project.join("package-lock.json")).unwrap()).unwrap()
+}
 
 #[test]
 fn workspace_nested_dependency_preserves_locked_metadata() {
@@ -69,20 +84,86 @@ fn workspace_nested_dependency_preserves_locked_metadata() {
     )
     .unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_utoo"))
-        .current_dir(project.path())
-        .env("UTOO_CACHE_DIR", cache.path())
-        .env("NO_UPDATE_NOTIFIER", "1")
-        .env("NO_PROXY", "127.0.0.1,localhost")
-        .env("no_proxy", "127.0.0.1,localhost")
-        .args(["deps", "--registry", &server.url()])
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "{output:?}");
-    let lock: Value =
-        serde_json::from_slice(&fs::read(project.path().join("package-lock.json")).unwrap())
-            .unwrap();
+    let lock = resolve_dependencies(project.path(), cache.path(), &server.url());
     assert_eq!(lock["packages"], baseline["packages"]);
     packument.assert();
     version.assert();
+}
+
+#[test]
+fn changed_conditional_overrides_replace_locked_workspace_dependency() {
+    let mut server = mockito::Server::new();
+    let mut versions = json!({});
+    let mut version_mocks = Vec::new();
+    for version in ["1.0.0", "2.0.0", "3.0.0", "4.0.0"] {
+        let manifest = json!({
+            "name": "shared", "version": version,
+            "dist": { "tarball": format!("{}/shared-{version}.tgz", server.url()) }
+        });
+        version_mocks.push(
+            server
+                .mock("GET", format!("/shared/{version}").as_str())
+                .with_body(manifest.to_string())
+                .create(),
+        );
+        versions[version] = manifest;
+    }
+    let _packument = server
+        .mock("GET", "/shared")
+        .with_body(
+            json!({
+                "name": "shared", "dist-tags": { "latest": "4.0.0" }, "versions": versions
+            })
+            .to_string(),
+        )
+        .create();
+    let project = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    let manifest_path = project.path().join("package.json");
+    let mut root = json!({
+        "name": "root", "version": "1.0.0", "workspaces": ["packages/*"],
+        "dependencies": { "shared": "1.0.0" }
+    });
+    fs::write(&manifest_path, root.to_string()).unwrap();
+    fs::create_dir_all(project.path().join("packages/app")).unwrap();
+    fs::write(
+        project.path().join("packages/app/package.json"),
+        json!({
+            "name": "app", "version": "1.0.0",
+            "dependencies": { "shared": "2.0.0" }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let initial = resolve_dependencies(project.path(), cache.path(), &server.url());
+    let nested = "packages/app/node_modules/shared";
+    assert_eq!(initial["packages"][nested]["version"], "2.0.0");
+
+    // Add and change overrides without deleting the workspace's existing lock.
+    for (selector, target, expected) in [
+        ("shared@^9.0.0", "3.0.0", "2.0.0"),
+        ("shared@^2.0.0", "2.0.0", "2.0.0"),
+        ("shared@^2.0.0", "3.0.0", "3.0.0"),
+        ("shared@^2.0.0", "4.0.0", "4.0.0"),
+    ] {
+        root["overrides"] = json!({ "app": { (selector): target } });
+        fs::write(&manifest_path, root.to_string()).unwrap();
+        let warm = resolve_dependencies(project.path(), cache.path(), &server.url());
+        assert_eq!(
+            warm["packages"][nested]["version"], expected,
+            "{selector} => {target}"
+        );
+        assert_eq!(
+            warm["packages"]["node_modules/shared"],
+            initial["packages"]["node_modules/shared"],
+        );
+
+        fs::remove_file(project.path().join("package-lock.json")).unwrap();
+        let cold = resolve_dependencies(project.path(), cache.path(), &server.url());
+        assert_eq!(
+            warm, cold,
+            "lockfile reuse differs for {selector} => {target}"
+        );
+    }
 }

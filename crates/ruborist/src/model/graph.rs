@@ -570,8 +570,8 @@ impl DependencyGraph {
     /// Find compatible node in parent chain for dependency resolution.
     ///
     /// For unconditional overrides (spec == "*"), uses the override target_spec.
-    /// HTTP tarball reuse also checks conditional overrides against the existing
-    /// node's version. Other conditional overrides are applied after resolution.
+    /// Reuse also checks conditional overrides against the existing node's
+    /// version before accepting a compatible package.
     pub fn find_compatible_node(
         &self,
         from: NodeIndex,
@@ -611,21 +611,19 @@ impl DependencyGraph {
             let compatible = match Protocol::strip_prefix(spec) {
                 // HTTP tarballs are identified by their source URL, not the
                 // version declared in their package.json.
-                Some((Protocol::Http, _)) => {
-                    let same_url = child
-                        .manifest
-                        .dist()
-                        .is_some_and(|dist| dist.tarball.as_deref() == Some(spec));
-                    // A URL match must not bypass a conditional override. A
-                    // different target needs the normal override resolver.
-                    same_url
-                        && self
-                            .check_override(requester, name, Some(&child.version))
-                            .is_none_or(|target| target == spec)
-                }
+                Some((Protocol::Http, _)) => child
+                    .manifest
+                    .dist()
+                    .is_some_and(|dist| dist.tarball.as_deref() == Some(spec)),
                 _ => matches(spec, &child.version),
             };
-            if compatible {
+            // Reuse must not bypass a conditional override. A different target
+            // needs the normal override resolver, even when the spec matches.
+            if compatible
+                && self
+                    .check_override(requester, name, Some(&child.version))
+                    .is_none_or(|target| target == spec)
+            {
                 return FindResult::Reuse(child_idx);
             }
             tracing::debug!(
