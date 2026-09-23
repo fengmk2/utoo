@@ -230,9 +230,13 @@ async fn run_utoo(project: &Path, cache: &Path, registry: &str, args: &[&str]) -
     serde_json::from_slice(&fs::read(project.join("package-lock.json")).unwrap()).unwrap()
 }
 
-#[tokio::test]
-async fn compatible_conditional_override_shares_module_state() {
+async fn check_conditional_override_shares_module_state(target: &str, http_dependency: bool) {
     let mut server = mockito::Server::new_async().await;
+    let shared_spec = if http_dependency {
+        format!("{}/shared.tgz", server.url())
+    } else {
+        "^1.0.0".to_string()
+    };
     let _shared = registry_package(
         &mut server,
         "shared",
@@ -242,13 +246,13 @@ async fn compatible_conditional_override_shares_module_state() {
     let _first = registry_package(
         &mut server,
         "first",
-        json!({ "shared": "^1.0.0" }),
+        json!({ "shared": shared_spec }),
         "module.exports = require('shared');",
     );
     let _second = registry_package(
         &mut server,
         "second",
-        json!({ "shared": "^1.0.0" }),
+        json!({ "shared": shared_spec }),
         "module.exports = require('shared');",
     );
     let project = tempdir().unwrap();
@@ -258,7 +262,7 @@ async fn compatible_conditional_override_shares_module_state() {
         json!({
             "name": "root", "version": "1.0.0", "private": true,
             "dependencies": { "first": "1.0.0", "second": "1.0.0" },
-            "overrides": { "shared@^1.0.0": "1.0.0" }
+            "overrides": { "shared@^1.0.0": target }
         })
         .to_string(),
     )
@@ -298,7 +302,21 @@ async fn compatible_conditional_override_shares_module_state() {
 }
 
 #[tokio::test]
-async fn compatible_conditional_overrides_close_dependency_cycles() {
+async fn compatible_conditional_override_shares_module_state() {
+    check_conditional_override_shares_module_state("1.0.0", false).await;
+}
+
+#[tokio::test]
+async fn conditional_dist_tag_override_shares_module_state() {
+    check_conditional_override_shares_module_state("latest", false).await;
+}
+
+#[tokio::test]
+async fn conditional_dist_tag_override_shares_http_dependency() {
+    check_conditional_override_shares_module_state("latest", true).await;
+}
+
+async fn check_conditional_overrides_close_dependency_cycles(target: &str) {
     let mut server = mockito::Server::new_async().await;
     let _a = registry_package(&mut server, "cycle-a", json!({ "cycle-b": "^1.0.0" }), "");
     let _b = registry_package(&mut server, "cycle-b", json!({ "cycle-a": "^1.0.0" }), "");
@@ -308,8 +326,8 @@ async fn compatible_conditional_overrides_close_dependency_cycles() {
         project.path().join("package.json"),
         json!({
             "name": "root", "version": "1.0.0", "private": true,
-            "dependencies": { "cycle-a": "1.0.0" },
-            "overrides": { "cycle-a@^1.0.0": "1.0.0", "cycle-b@^1.0.0": "1.0.0" }
+            "dependencies": { "cycle-a": target },
+            "overrides": { "cycle-a@^1.0.0": target, "cycle-b@^1.0.0": target }
         })
         .to_string(),
     )
@@ -326,4 +344,14 @@ async fn compatible_conditional_overrides_close_dependency_cycles() {
             assert_eq!(package["dependencies"][dependency], "^1.0.0");
         }
     }
+}
+
+#[tokio::test]
+async fn compatible_conditional_overrides_close_dependency_cycles() {
+    check_conditional_overrides_close_dependency_cycles("1.0.0").await;
+}
+
+#[tokio::test]
+async fn conditional_dist_tag_overrides_close_dependency_cycles() {
+    check_conditional_overrides_close_dependency_cycles("latest").await;
 }

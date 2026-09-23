@@ -594,21 +594,8 @@ impl DependencyGraph {
 
         // Start with the requester's own node_modules, including nested nodes
         // seeded from a lockfile, before looking in ancestor directories.
-        self.find_in_parent_chain(from, name, &effective_spec, from)
-    }
-
-    /// Recursively search for compatible node in parent chain.
-    fn find_in_parent_chain(
-        &self,
-        current: NodeIndex,
-        name: &str,
-        spec: &str,
-        requester: NodeIndex,
-    ) -> FindResult {
-        // Probe the per-parent name index — O(depth) total instead of a
-        // linear scan over every physical child per ancestor level.
-        if let Some(child_idx) = self.find_physical_child(current, name) {
-            let child = &self.graph[child_idx];
+        self.find_in_parent_chain(from, name, |child| {
+            let spec = effective_spec.as_str();
             let matches_candidate = |spec: &str| match Protocol::strip_prefix(spec) {
                 // HTTP tarballs are identified by their source URL, not the
                 // version declared in their package.json.
@@ -620,42 +607,72 @@ impl DependencyGraph {
             };
             // Compare the selected target with the package, not the requested
             // spec: a range and an exact version can select the same package.
-            if matches_candidate(spec)
+            matches_candidate(spec)
                 && self
-                    .check_override(requester, name, Some(&child.version))
+                    .check_override(from, name, Some(&child.version))
                     .is_none_or(|target| match Protocol::strip_prefix(&target) {
                         Some((Protocol::Http, _)) => matches_candidate(&target),
                         None | Some((Protocol::NpmAlias, _)) => {
                             let (target_name, target_range) = normalize_spec(name, &target);
                             child.manifest.name() == target_name
                                 && VersionReq::parse_from_npm(&target_range).is_ok_and(|req| {
-                                    // A changed dist-tag needs registry resolution;
+                                    // A dist-tag needs registry resolution;
                                     // the candidate's version cannot identify it.
-                                    (req.tag().is_none() || target == spec)
-                                        && matches(&target_range, &child.version)
+                                    req.tag().is_none() && matches(&target_range, &child.version)
                                 })
                         }
                         _ => target == spec,
                     })
-            {
-                return FindResult::Reuse(child_idx);
-            }
-            tracing::debug!(
-                "found conflict deps {}@{} got {}, conflict at {:?}",
-                name,
-                spec,
-                child.version,
-                child_idx
-            );
-            return FindResult::Conflict(requester);
-        }
+        })
+    }
 
-        // Recurse to parent
-        if let Some(parent) = self.get_physical_parent(current) {
-            self.find_in_parent_chain(parent, name, spec, requester)
-        } else {
-            // Reached root, install here
-            FindResult::New(current)
+    /// Find an existing copy of the final manifest after overrides have resolved.
+    /// Do not recheck the original spec or apply overrides to the target again.
+    pub(crate) fn find_resolved_node(
+        &self,
+        from: NodeIndex,
+        name: &str,
+        manifest: &CoreVersionManifest,
+    ) -> FindResult {
+        self.find_in_parent_chain(from, name, |child| {
+            child.manifest.name() == manifest.name
+                && child.version == manifest.version
+                && child
+                    .manifest
+                    .dist()
+                    .is_some_and(|dist| dist.tarball == manifest.dist.tarball)
+        })
+    }
+
+    /// Search the requester's node_modules and then its ancestors. A nearer
+    /// incompatible package shadows matching packages higher in the tree.
+    fn find_in_parent_chain(
+        &self,
+        from: NodeIndex,
+        name: &str,
+        matches_candidate: impl Fn(&PackageNode) -> bool,
+    ) -> FindResult {
+        let mut current = from;
+        loop {
+            // Probe the per-parent name index — O(depth) total instead of a
+            // linear scan over every physical child per ancestor level.
+            if let Some(child_idx) = self.find_physical_child(current, name) {
+                let child = &self.graph[child_idx];
+                if matches_candidate(child) {
+                    return FindResult::Reuse(child_idx);
+                }
+                tracing::debug!(
+                    "found conflict deps {} got {}, conflict at {:?}",
+                    name,
+                    child.version,
+                    child_idx
+                );
+                return FindResult::Conflict(from);
+            }
+            match self.get_physical_parent(current) {
+                Some(parent) => current = parent,
+                None => return FindResult::New(current),
+            }
         }
     }
 }
@@ -926,10 +943,70 @@ mod tests {
             } else {
                 FindResult::Conflict(graph.root_index)
             };
+            for spec in ["^1.0.0", "latest"] {
+                assert_eq!(
+                    graph.find_compatible_node(graph.root_index, "shared", spec),
+                    expected,
+                    "request {spec}, override {target}, candidate {manifest_name}@1.0.0 from {resolved:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_find_resolved_node_matches_manifest_identity() {
+        let url = "https://registry.example.com/shared-2.0.0.tgz";
+        let mut resolved = CoreVersionManifest {
+            name: "shared".to_string(),
+            version: "2.0.0".to_string(),
+            ..Default::default()
+        };
+        resolved.dist.tarball = Some(url.to_string());
+
+        for (name, version, source, can_reuse) in [
+            ("shared", "2.0.0", Some(url), true),
+            ("other", "2.0.0", Some(url), false),
+            ("shared", "1.0.0", Some(url), false),
+            (
+                "shared",
+                "2.0.0",
+                Some("https://example.com/patched.tgz"),
+                false,
+            ),
+            ("shared", "2.0.0", None, false),
+        ] {
+            let pkg = PackageJson::from_value(&serde_json::json!({
+                "name": "root", "version": "1.0.0",
+                "overrides": { "shared@^1.0.0": "latest" }
+            }))
+            .unwrap();
+            let mut graph = DependencyGraph::from_package_json(PathBuf::from("."), pkg);
+            let mut candidate = CoreVersionManifest {
+                name: name.to_string(),
+                version: version.to_string(),
+                ..Default::default()
+            };
+            candidate.dist.tarball = source.map(str::to_string);
+            let shared = graph.add_node(PackageNode::from_version_manifest(
+                "shared".to_string(),
+                PathBuf::from("node_modules/shared"),
+                Arc::new(candidate),
+            ));
+            graph.add_physical_edge(graph.root_index, shared);
+
             assert_eq!(
                 graph.find_compatible_node(graph.root_index, "shared", "^1.0.0"),
+                FindResult::Conflict(graph.root_index),
+            );
+            let expected = if can_reuse {
+                FindResult::Reuse(shared)
+            } else {
+                FindResult::Conflict(graph.root_index)
+            };
+            assert_eq!(
+                graph.find_resolved_node(graph.root_index, "shared", &resolved),
                 expected,
-                "override {target}, candidate {manifest_name}@1.0.0 from {resolved:?}",
+                "candidate {name}@{version} from {source:?}",
             );
         }
     }
