@@ -8,9 +8,23 @@ use deno_semver::VersionReq;
 use super::semver::{matches, normalize_spec};
 use crate::model::graph::PackageNode;
 use crate::model::manifest::CoreVersionManifest;
-use crate::spec::Protocol;
+use crate::spec::{Protocol, SpecStr};
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MatchResult {
+    Match,
+    NoMatch,
+    NeedsResolution,
+}
+
+impl From<bool> for MatchResult {
+    fn from(matches: bool) -> Self {
+        if matches { Self::Match } else { Self::NoMatch }
+    }
+}
 
 /// Check the requested spec against an existing package before resolution.
+/// Preserve the lockfile reuse policy for ordinary dist-tag requests.
 pub(crate) fn matches_spec(candidate: &PackageNode, spec: &str) -> bool {
     match Protocol::strip_prefix(spec) {
         // HTTP tarballs are identified by their source URL, not the
@@ -23,25 +37,24 @@ pub(crate) fn matches_spec(candidate: &PackageNode, spec: &str) -> bool {
     }
 }
 
-/// Check a selected override target without resolving it or selecting rules.
-pub(crate) fn matches_override_target(
-    candidate: &PackageNode,
-    name: &str,
-    spec: &str,
-    target: &str,
-) -> bool {
+/// Check a concrete requirement without performing I/O or selecting overrides.
+/// Tags and non-registry sources need the final manifest to establish identity.
+pub(crate) fn match_target(candidate: &PackageNode, name: &str, target: &str) -> MatchResult {
     match Protocol::strip_prefix(target) {
-        Some((Protocol::Http, _)) => matches_spec(candidate, target),
+        Some((Protocol::Http, _)) => matches_spec(candidate, target).into(),
+        None if !target.is_registry_spec() => MatchResult::NeedsResolution,
         None | Some((Protocol::NpmAlias, _)) => {
             let (target_name, target_range) = normalize_spec(name, target);
-            candidate.manifest.name() == target_name
-                && VersionReq::parse_from_npm(&target_range).is_ok_and(|req| {
-                    // A dist-tag needs registry resolution;
-                    // the candidate's version cannot identify it.
-                    req.tag().is_none() && matches(&target_range, &candidate.version)
-                })
+            if candidate.manifest.name() != target_name {
+                return MatchResult::NoMatch;
+            }
+            match VersionReq::parse_from_npm(&target_range) {
+                Ok(req) if req.tag().is_some() => MatchResult::NeedsResolution,
+                Ok(_) => matches(&target_range, &candidate.version).into(),
+                Err(_) => MatchResult::NoMatch,
+            }
         }
-        _ => target == spec,
+        _ => MatchResult::NeedsResolution,
     }
 }
 

@@ -36,6 +36,7 @@ pub(crate) mod matching;
 pub mod node_types;
 pub mod placement;
 pub mod registry;
+pub(crate) mod reuse;
 pub mod runtime;
 pub mod semver;
 #[cfg(feature = "http-tarball")]
