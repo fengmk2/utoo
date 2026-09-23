@@ -13,6 +13,7 @@ use super::node::{EdgeType, NodeType};
 use super::override_rule::Overrides;
 use super::package_json::PackageJson;
 use crate::resolver::semver::matches;
+use crate::spec::Protocol;
 
 /// Package node in the dependency graph.
 #[derive(Debug, Clone)]
@@ -609,7 +610,19 @@ impl DependencyGraph {
         // linear scan over every physical child per ancestor level.
         if let Some(child_idx) = self.find_physical_child(current, name) {
             let child = &self.graph[child_idx];
-            if matches(spec, &child.version) {
+            let compatible = match Protocol::strip_prefix(spec) {
+                // HTTP tarballs are identified by their source URL, not the
+                // version declared in their package.json.
+                Some((Protocol::Http, _)) => {
+                    child
+                        .manifest
+                        .dist()
+                        .and_then(|dist| dist.tarball.as_deref())
+                        == Some(spec)
+                }
+                _ => matches(spec, &child.version),
+            };
+            if compatible {
                 return FindResult::Reuse(child_idx);
             }
             tracing::debug!(
@@ -784,6 +797,50 @@ mod tests {
         // Should reuse existing lodash when spec matches
         let result = graph.find_compatible_node(graph.root_index, "lodash", "^4.17.0");
         assert_eq!(result, FindResult::Reuse(lodash_idx));
+    }
+
+    #[test]
+    fn test_find_compatible_http_tarball() {
+        for url in [
+            "http://example.com/shared.tgz",
+            "https://pkg.pr.new/shared@commit",
+        ] {
+            for resolved in [Some(url.to_string()), Some(format!("{url}?other")), None] {
+                let mut graph = DependencyGraph::from_package_json(
+                    PathBuf::from("."),
+                    create_pkg("root", "1.0.0"),
+                );
+                let mut manifest = CoreVersionManifest {
+                    name: "shared".to_string(),
+                    version: "1.0.0".to_string(),
+                    ..Default::default()
+                };
+                manifest.dist.tarball = resolved.clone();
+                let shared = graph.add_node(PackageNode::from_version_manifest(
+                    "shared".to_string(),
+                    PathBuf::from("node_modules/shared"),
+                    Arc::new(manifest),
+                ));
+                graph.add_physical_edge(graph.root_index, shared);
+                let consumer = graph.add_node(PackageNode::from_version_manifest(
+                    "consumer".to_string(),
+                    PathBuf::from("node_modules/consumer"),
+                    create_version_manifest("consumer", "1.0.0"),
+                ));
+                graph.add_physical_edge(graph.root_index, consumer);
+
+                let expected = if resolved.as_deref() == Some(url) {
+                    FindResult::Reuse(shared)
+                } else {
+                    FindResult::Conflict(consumer)
+                };
+                assert_eq!(
+                    graph.find_compatible_node(consumer, "shared", url),
+                    expected,
+                    "requested {url}, resolved {resolved:?}"
+                );
+            }
+        }
     }
 
     #[test]
