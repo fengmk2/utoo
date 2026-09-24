@@ -341,6 +341,7 @@ mod tests {
     use crate::model::graph::{FindResult, PackageNode};
     use crate::model::manifest::CoreVersionManifest;
     use crate::model::package_json::PackageJson;
+    use crate::resolver::reuse::{ReuseResult, find_resolved_node};
 
     fn create_pkg(name: &str, version: &str) -> PackageJson {
         PackageJson::new(name, version)
@@ -414,14 +415,21 @@ mod tests {
                     "{overrides}"
                 );
             }
+            let expected = if can_reuse {
+                ReuseResult::Reuse(shared)
+            } else {
+                ReuseResult::Install(consumer)
+            };
+            for spec in [url, "^1.0.0", "latest"] {
+                assert_eq!(
+                    find_resolved_node(&graph, consumer, "shared", spec, &manifest),
+                    expected,
+                    "{overrides}"
+                );
+            }
             assert_eq!(
-                graph.find_resolved_node(consumer, "shared", &manifest),
-                expected,
-                "{overrides}"
-            );
-            assert_eq!(
-                graph.find_resolved_node(graph.root_index, "shared", &manifest),
-                FindResult::Reuse(shared)
+                find_resolved_node(&graph, graph.root_index, "shared", url, &manifest),
+                ReuseResult::Reuse(shared)
             );
         }
     }
