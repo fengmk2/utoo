@@ -287,7 +287,8 @@ pub fn serialize_to_packages(
     graph: &DependencyGraph,
     root_path: &Path,
 ) -> (HashMap<String, LockPackage>, i32) {
-    serialize_to_packages_filtered(graph, root_path, None)
+    let reachable = graph.has_redundant_nodes.then(|| graph.reachable_nodes());
+    serialize_to_packages_filtered(graph, root_path, reachable.as_ref())
 }
 
 /// Serialize the graph, optionally restricting output to a set of reachable

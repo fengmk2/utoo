@@ -358,16 +358,30 @@ async fn conditional_dist_tag_overrides_close_dependency_cycles() {
 
 #[tokio::test]
 async fn http_reuse_preserves_descendant_overrides() {
+    check_http_descendant_overrides(false).await;
+    check_http_descendant_overrides(true).await;
+}
+
+async fn check_http_descendant_overrides(deep: bool) {
     let mut server = mockito::Server::new_async().await;
+    let dependency = if deep { "bridge" } else { "inner" };
+    let _bridge = deep.then(|| {
+        registry_package(
+            &mut server,
+            "bridge",
+            json!({ "inner": "1.0.0" }),
+            "module.exports = require('inner');",
+        )
+    });
     let shared_url = format!("{}/shared.tgz", server.url());
     let _shared = server
         .mock("GET", "/shared.tgz")
         .with_body(tarball(
             json!({
                 "name": "shared", "version": "1.0.0", "main": "index.js",
-                "dependencies": { "inner": "1.0.0" }
+                "dependencies": { (dependency): "1.0.0" }
             }),
-            "module.exports = require('inner');",
+            &format!("module.exports = require('{dependency}');"),
         ))
         .create();
     let _consumer = server
@@ -415,6 +429,11 @@ async fn http_reuse_preserves_descendant_overrides() {
         .create();
     let project = tempdir().unwrap();
     let cache = tempdir().unwrap();
+    let override_rule = if deep {
+        json!({ "bridge": { "inner": "2.0.0" } })
+    } else {
+        json!({ "inner": "2.0.0" })
+    };
     fs::write(
         project.path().join("package.json"),
         json!({
@@ -423,7 +442,7 @@ async fn http_reuse_preserves_descendant_overrides() {
                 "shared": shared_url,
                 "consumer": format!("{}/consumer.tgz", server.url())
             },
-            "overrides": { "consumer": { "shared": { "inner": "2.0.0" } } }
+            "overrides": { "consumer": { "shared": override_rule } }
         })
         .to_string(),
     )
@@ -453,5 +472,162 @@ async fn http_reuse_preserves_descendant_overrides() {
             .output()
             .unwrap();
         assert!(output.status.success(), "{output:?}");
+    }
+}
+
+#[tokio::test]
+async fn equivalent_nested_overrides_preserve_module_identity() {
+    for (override_rule, inner, cycle) in [
+        (json!({ "inner": "1.0.0" }), "inner", false),
+        (json!({ "unused": "2.0.0" }), "inner", false),
+        (json!({ "z-inner": "1.0.0" }), "z-inner", false),
+        (json!({ "inner": "latest" }), "inner", false),
+        (json!({ "unused": "2.0.0" }), "z-inner", true),
+    ] {
+        let mut server = mockito::Server::new_async().await;
+        let inner_dependencies = if cycle {
+            json!({ "shared": "1.0.0" })
+        } else {
+            json!({})
+        };
+        let _inner = registry_package(&mut server, inner, inner_dependencies, "");
+        let _shared = registry_package(
+            &mut server,
+            "shared",
+            json!({ (inner): "1.0.0" }),
+            "module.exports = new Map();",
+        );
+        let _consumer = registry_package(
+            &mut server,
+            "consumer",
+            json!({ "shared": "1.0.0" }),
+            "module.exports = require('shared');",
+        );
+        let project = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        fs::write(
+            project.path().join("package.json"),
+            json!({
+                "name": "root", "version": "1.0.0", "private": true,
+                "dependencies": { "shared": "1.0.0", "consumer": "1.0.0" },
+                "overrides": { "consumer": { "shared": override_rule } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        for reinstall in [false, true] {
+            if reinstall {
+                fs::remove_dir_all(project.path().join("node_modules")).unwrap();
+            }
+            let lock = run_utoo(
+                project.path(),
+                cache.path(),
+                &server.url(),
+                &["install", "--ignore-scripts"],
+            )
+            .await;
+            let output = Command::new("node")
+                .current_dir(project.path())
+                .args([
+                    "-e",
+                    r#"
+                const assert = require("node:assert/strict");
+                const shared = require("shared");
+                const consumer = require("consumer");
+                shared.set("example", 42);
+                assert.equal(shared, consumer);
+                assert.equal(consumer.get("example"), 42);
+            "#,
+                ])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{override_rule}: {output:?}");
+            assert_eq!(lock["packages"].as_object().unwrap().len(), 4);
+        }
+    }
+}
+
+#[tokio::test]
+async fn changed_override_keeps_consumers_on_one_module_instance() {
+    let mut server = mockito::Server::new_async().await;
+    let _first = registry_package(
+        &mut server,
+        "first",
+        json!({ "shared": "^1.0.0" }),
+        "module.exports = require('shared');",
+    );
+    let _second = registry_package(
+        &mut server,
+        "second",
+        json!({ "shared": "^1.0.0" }),
+        "module.exports = require('shared');",
+    );
+    let mut mocks = Vec::new();
+    let mut versions = json!({});
+    for version in ["1.0.0", "2.0.0"] {
+        let manifest = json!({
+            "name": "shared", "version": version, "main": "index.js",
+            "dist": { "tarball": format!("{}/shared-{version}.tgz", server.url()) }
+        });
+        mocks.push(
+            server
+                .mock("GET", format!("/shared/{version}").as_str())
+                .with_body(manifest.to_string())
+                .create(),
+        );
+        mocks.push(
+            server
+                .mock("GET", format!("/shared-{version}.tgz").as_str())
+                .with_body(tarball(manifest.clone(), "module.exports = new Map();"))
+                .create(),
+        );
+        versions[version] = manifest;
+    }
+    let _metadata = server
+        .mock("GET", "/shared")
+        .with_body(
+            json!({
+                "name": "shared", "dist-tags": { "latest": "2.0.0" }, "versions": versions
+            })
+            .to_string(),
+        )
+        .create();
+    let project = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    for target in ["1.0.0", "2.0.0"] {
+        fs::write(
+            project.path().join("package.json"),
+            json!({
+                "name": "root", "version": "1.0.0", "private": true,
+                "dependencies": { "first": "1.0.0", "second": "1.0.0" },
+                "overrides": { "shared": target }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        if target == "2.0.0" {
+            run_utoo(project.path(), cache.path(), &server.url(), &["deps"]).await;
+            fs::remove_dir_all(project.path().join("node_modules")).unwrap();
+        }
+        let lock = run_utoo(
+            project.path(),
+            cache.path(),
+            &server.url(),
+            &["install", "--ignore-scripts"],
+        )
+        .await;
+        let output = Command::new("node")
+            .current_dir(project.path())
+            .args([
+                "-e",
+                r#"
+            require("node:assert/strict").equal(require("first"), require("second"));
+        "#,
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{target}: {output:?}");
+        assert_eq!(lock["packages"]["node_modules/shared"]["version"], target);
+        assert_eq!(lock["packages"].as_object().unwrap().len(), 4);
     }
 }

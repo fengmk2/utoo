@@ -212,6 +212,11 @@ pub struct DependencyGraph {
     pub(crate) overrides: Option<Overrides>,
     /// Fast lookup set for override names
     pub(crate) override_names: HashSet<String>,
+    /// Override contexts can require provisional copies until their subtrees resolve.
+    pub(crate) has_redundant_nodes: bool,
+    /// Edges whose recorded override inputs no longer validate their targets.
+    resolution_required: HashMap<EdgeIndex, Option<NodeIndex>>,
+    revalidation_nodes: HashSet<NodeIndex>,
     /// Per-parent `name → child` index over physical edges, maintained by
     /// [`add_physical_edge`](Self::add_physical_edge) (the graph is
     /// append-only — no edge ever gets removed). Hoisting parks most packages
@@ -265,6 +270,9 @@ impl DependencyGraph {
             root_index,
             overrides,
             override_names,
+            has_redundant_nodes: false,
+            resolution_required: HashMap::new(),
+            revalidation_nodes: HashSet::new(),
             child_index: HashMap::new(),
             workspace_members: HashMap::new(),
         }
@@ -305,7 +313,7 @@ impl DependencyGraph {
     }
 
     /// O(1) lookup of a physical child by name (see `child_index`).
-    fn find_physical_child(&self, parent: NodeIndex, name: &str) -> Option<NodeIndex> {
+    pub(crate) fn find_physical_child(&self, parent: NodeIndex, name: &str) -> Option<NodeIndex> {
         self.child_index.get(&parent)?.get(name).copied()
     }
 
@@ -412,10 +420,54 @@ impl DependencyGraph {
 
     /// Mark a dependency edge as resolved.
     pub fn mark_dependency_resolved(&mut self, edge_id: EdgeIndex, target: NodeIndex) {
+        self.resolution_required.remove(&edge_id);
         if let Some(GraphEdge::Dependency(dep)) = self.graph.edge_weight_mut(edge_id) {
             dep.valid = true;
             dep.to = Some(target);
         }
+    }
+
+    pub(crate) fn requires_resolution(&self, edge: EdgeIndex) -> bool {
+        self.resolution_required.contains_key(&edge)
+    }
+
+    pub(crate) fn invalidate_dependency(&mut self, edge: EdgeIndex) {
+        if let Some(GraphEdge::Dependency(dep)) = self.graph.edge_weight_mut(edge) {
+            self.resolution_required.insert(edge, dep.to);
+            dep.valid = false;
+            dep.to = None;
+            if let Some((from, _)) = self.graph.edge_endpoints(edge) {
+                self.revalidation_nodes.insert(from);
+            }
+        }
+    }
+
+    /// Revisit affected locked nodes only after an importer reaches them. This
+    /// avoids resolving removed or replaced subtrees just because they were seeded.
+    pub(crate) fn take_revalidation_nodes(&mut self) -> Vec<NodeIndex> {
+        if self.revalidation_nodes.is_empty() {
+            return Vec::new();
+        }
+        let reachable = self.reachable_nodes();
+        let mut pending = Vec::new();
+        let nodes: Vec<_> = self
+            .revalidation_nodes
+            .iter()
+            .copied()
+            .filter(|node| reachable.contains(node))
+            .collect();
+        for node in nodes {
+            self.revalidation_nodes.remove(&node);
+            if self
+                .get_dependency_edges(node)
+                .iter()
+                .any(|(edge, _)| self.requires_resolution(*edge))
+            {
+                pending.push(node);
+            }
+        }
+        pending.sort_unstable();
+        pending
     }
 
     /// Update the spec on a dependency edge (e.g. after resolving `catalog:` protocol).
@@ -594,7 +646,7 @@ impl DependencyGraph {
 
         // Start with the requester's own node_modules, including nested nodes
         // seeded from a lockfile, before looking in ancestor directories.
-        self.find_in_parent_chain(from, name, |child| {
+        self.find_in_parent_chain(from, name, false, |child| {
             let spec = effective_spec.as_str();
             let matches_candidate = |spec: &str| match Protocol::strip_prefix(spec) {
                 // HTTP tarballs are identified by their source URL, not the
@@ -634,7 +686,7 @@ impl DependencyGraph {
         name: &str,
         manifest: &CoreVersionManifest,
     ) -> FindResult {
-        self.find_in_parent_chain(from, name, |child| {
+        self.find_in_parent_chain(from, name, true, |child| {
             child.manifest.name() == manifest.name
                 && child.version == manifest.version
                 && child
@@ -650,6 +702,7 @@ impl DependencyGraph {
         &self,
         from: NodeIndex,
         name: &str,
+        replace_unused_override_target: bool,
         matches_candidate: impl Fn(&PackageNode) -> bool,
     ) -> FindResult {
         let mut current = from;
@@ -662,6 +715,21 @@ impl DependencyGraph {
                     && self.has_compatible_descendant_overrides(from, child_idx)
                 {
                     return FindResult::Reuse(child_idx);
+                }
+                // A changed global override can vacate a locked slot. Place its
+                // replacement there so sibling consumers can still share it.
+                // Scoped rules need the requester's parent context instead.
+                if replace_unused_override_target
+                    && self
+                        .resolution_required
+                        .values()
+                        .any(|target| *target == Some(child_idx))
+                    && self.overrides.as_ref().is_some_and(|overrides| {
+                        overrides.rules.iter().all(|rule| rule.parent.is_none())
+                    })
+                    && !self.reachable_nodes().contains(&child_idx)
+                {
+                    return FindResult::New(current);
                 }
                 tracing::debug!(
                     "found conflict deps {} got {}, conflict at {:?}",

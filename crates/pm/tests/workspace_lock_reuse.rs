@@ -278,3 +278,132 @@ fn unchanged_dist_tag_override_preserves_locked_version() {
         }
     }
 }
+
+#[test]
+fn legacy_lock_preserves_pins_when_override_metadata_is_missing() {
+    check_override_lock_pins(
+        json!({ "shared": "1.0.0", "unrelated@^9": { "inner": "9.0.0" } }),
+        None,
+        "1.0.0",
+        "1.0.0",
+    );
+    check_override_lock_pins(json!({ "shared": "1.0.0" }), None, "1.0.0", "1.0.0");
+    check_override_lock_pins(
+        json!({ "shared": { "inner": "1.1.0" } }),
+        None,
+        "1.0.0",
+        "1.1.0",
+    );
+}
+
+#[test]
+fn changed_nested_override_preserves_unaffected_pins() {
+    check_override_lock_pins(
+        json!({ "shared": { "inner": "1.1.0" } }),
+        Some(json!({ "shared": { "inner": "1.0.0" } })),
+        "1.0.0",
+        "1.1.0",
+    );
+    check_override_lock_pins(
+        json!({}),
+        Some(json!({ "shared": { "inner": "1.1.0" } })),
+        "1.1.0",
+        "1.0.0",
+    );
+}
+
+fn check_override_lock_pins(
+    overrides: Value,
+    previous: Option<Value>,
+    locked_inner: &str,
+    expected_inner: &str,
+) {
+    let mut server = mockito::Server::new();
+    let mut mocks = Vec::new();
+    let root = json!({
+        "name": "root", "version": "1.0.0", "private": true,
+        "dependencies": { "shared": "1.0.0", "unrelated": "^1.0.0" },
+        "overrides": overrides
+    });
+    let mut locked_root = root.clone();
+    locked_root.as_object_mut().unwrap().remove("overrides");
+    locked_root.as_object_mut().unwrap().remove("private");
+    if let Some(previous) = previous {
+        locked_root["overrides"] = previous;
+    }
+    let mut packages = json!({ "": locked_root });
+    for name in ["shared", "inner", "unrelated"] {
+        let mut versions = json!({});
+        for version in ["1.0.0", "1.1.0"] {
+            let mut manifest = json!({
+                "name": name, "version": version,
+                "dist": { "tarball": format!("{}/{name}-{version}.tgz", server.url()) }
+            });
+            if name == "shared" {
+                manifest["dependencies"] = json!({ "inner": "1.0.0" });
+            }
+            let mock = server
+                .mock("GET", format!("/{name}/{version}").as_str())
+                .with_body(manifest.to_string());
+            mocks.push(
+                if name == "unrelated" {
+                    mock.expect(0)
+                } else {
+                    mock.expect_at_least(0)
+                }
+                .create(),
+            );
+            versions[version] = manifest;
+        }
+        let mock = server.mock("GET", format!("/{name}").as_str()).with_body(
+            json!({
+                "name": name, "dist-tags": { "latest": "1.1.0" }, "versions": versions
+            })
+            .to_string(),
+        );
+        mocks.push(
+            if name == "unrelated" {
+                mock.expect(0)
+            } else {
+                mock.expect_at_least(0)
+            }
+            .create(),
+        );
+        let version = if name == "inner" {
+            locked_inner
+        } else {
+            "1.0.0"
+        };
+        packages[format!("node_modules/{name}")] = json!({
+            "version": version, "resolved": format!("{}/{name}-{version}.tgz", server.url())
+        });
+    }
+    packages["node_modules/shared"]["dependencies"] = json!({ "inner": "1.0.0" });
+    let project = tempdir().unwrap();
+    fs::write(project.path().join("package.json"), root.to_string()).unwrap();
+    fs::write(
+        project.path().join("package-lock.json"),
+        json!({
+            "name": "root", "version": "1.0.0", "lockfileVersion": 3, "requires": true,
+            "packages": packages
+        })
+        .to_string(),
+    )
+    .unwrap();
+    for _ in 0..2 {
+        let lock = resolve_dependencies(project.path(), tempdir().unwrap().path(), &server.url());
+        assert_eq!(
+            lock["packages"]["node_modules/unrelated"]["version"],
+            "1.0.0"
+        );
+        assert_eq!(lock["packages"]["node_modules/shared"]["version"], "1.0.0");
+        let inner = lock["packages"]
+            .get("node_modules/shared/node_modules/inner")
+            .unwrap_or(&lock["packages"]["node_modules/inner"]);
+        assert_eq!(inner["version"], expected_inner);
+        assert_eq!(lock["packages"][""]["overrides"], root["overrides"]);
+    }
+    for mock in mocks {
+        mock.assert();
+    }
+}
