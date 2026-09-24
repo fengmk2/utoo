@@ -5,16 +5,99 @@
 //! node's physical parent chain and deciding whether a rule applies. Kept out
 //! of `graph.rs` so the graph file stays focused on the data structure.
 
+use std::collections::HashSet;
+
 use petgraph::graph::NodeIndex;
 
-use super::graph::DependencyGraph;
+use super::graph::{DependencyGraph, GraphEdge};
 use super::override_rule::OverrideRule;
 use crate::resolver::semver::matches;
 
 impl DependencyGraph {
-    /// Sharing a node also shares its dependency subtree. Each nested rule must
-    /// have the same remaining parent conditions under both paths, including
-    /// rules that only become active further down the subtree.
+    /// Different override contexts may produce identical dependency results.
+    /// Wait until resolution is complete before discarding provisional copies:
+    /// an unresolved child could still contain an affected descendant.
+    pub(crate) fn deduplicate_override_subtrees(&mut self) {
+        if self
+            .overrides
+            .as_ref()
+            .is_none_or(|overrides| overrides.rules.iter().all(|rule| rule.parent.is_none()))
+        {
+            return;
+        }
+        let nodes: Vec<_> = self.graph.node_indices().collect();
+        for node in nodes {
+            let Some(parent) = self.get_physical_parent(node) else {
+                continue;
+            };
+            let mut ancestor = self.get_physical_parent(parent);
+            while let Some(index) = ancestor {
+                if let Some(candidate) = self.find_physical_child(index, &self.graph[node].name) {
+                    // The nearest same-name package shadows all higher copies.
+                    if self.resolved_subtrees_match(node, candidate) {
+                        for edge in self.graph.edge_weights_mut() {
+                            if let GraphEdge::Dependency(dep) = edge
+                                && dep.to == Some(node)
+                            {
+                                dep.to = Some(candidate);
+                            }
+                        }
+                        self.has_redundant_nodes = true;
+                    }
+                    break;
+                }
+                ancestor = self.get_physical_parent(index);
+            }
+        }
+    }
+
+    fn resolved_subtrees_match(&self, left: NodeIndex, right: NodeIndex) -> bool {
+        let mut pending = vec![(left, right)];
+        let mut seen = HashSet::new();
+        while let Some((left, right)) = pending.pop() {
+            if left == right || !seen.insert((left, right)) {
+                continue;
+            }
+            let a = &self.graph[left];
+            let b = &self.graph[right];
+            let source = a.manifest.dist().and_then(|dist| dist.tarball.as_deref());
+            if a.is_workspace()
+                || a.is_link()
+                || b.is_workspace()
+                || b.is_link()
+                || a.manifest.name() != b.manifest.name()
+                || a.version != b.version
+                || source.is_none()
+                || source != b.manifest.dist().and_then(|dist| dist.tarball.as_deref())
+            {
+                return false;
+            }
+            let left_edges = self.get_dependency_edges(left);
+            let right_edges = self.get_dependency_edges(right);
+            if left_edges.len() != right_edges.len() {
+                return false;
+            }
+            for (_, edge) in left_edges {
+                let Some((_, other)) = right_edges.iter().find(|(_, other)| {
+                    edge.name == other.name
+                        && edge.edge_type == other.edge_type
+                        && edge.spec == other.spec
+                }) else {
+                    return false;
+                };
+                match (edge.to, other.to) {
+                    (Some(a), Some(b)) if edge.valid && other.valid => pending.push((a, b)),
+                    (None, None) => {}
+                    _ => return false,
+                }
+            }
+        }
+        true
+    }
+
+    /// Reuse immediately when both paths have the same remaining rule conditions.
+    /// Otherwise resolve separate subtrees first; `deduplicate_override_subtrees`
+    /// can share them once their effective dependency results are known.
     pub(crate) fn has_compatible_descendant_overrides(
         &self,
         from: NodeIndex,
@@ -86,7 +169,7 @@ impl DependencyGraph {
     /// "express": { "body-parser": { "debug": "4.0.0" } }
     /// meaning debug should be overridden when its parent is body-parser AND
     /// body-parser's parent is express.
-    fn collect_parent_chain(&self, from: NodeIndex) -> Vec<(String, String)> {
+    pub(crate) fn collect_parent_chain(&self, from: NodeIndex) -> Vec<(String, String)> {
         let mut chain = Vec::new();
         let mut current = from;
 
@@ -107,6 +190,31 @@ impl DependencyGraph {
 
         chain.reverse();
         chain
+    }
+
+    /// A changed rule can affect its leaf or any package that introduces one
+    /// of its parent scopes. Other branches keep their locked resolutions.
+    pub(crate) fn override_rules_affect_dependency(
+        &self,
+        rules: &[OverrideRule],
+        name: &str,
+        chain: &[(String, String)],
+        include_parent_scopes: bool,
+    ) -> bool {
+        rules.iter().any(|rule| {
+            let mut selector = Some(rule);
+            while let Some(rule) = selector {
+                if rule.name == name && self.matches_parent_chain_for_rule(rule, chain) {
+                    return true;
+                }
+                selector = if include_parent_scopes {
+                    rule.parent.as_deref()
+                } else {
+                    None
+                };
+            }
+            false
+        })
     }
 
     /// Check if an override rule applies.

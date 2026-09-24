@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use super::*;
 use crate::model::graph::PackageNode;
+use crate::model::node::EdgeType;
 use crate::model::package_json::PackageJson;
 
 fn create_pkg(name: &str, version: &str) -> PackageJson {
@@ -361,4 +362,115 @@ fn test_find_resolved_node_uses_final_identity_for_file_and_git_sources() {
             );
         }
     }
+}
+
+fn create_shared_revalidation_graph(
+    overrides: serde_json::Value,
+    record_target: bool,
+) -> (DependencyGraph, NodeIndex, NodeIndex) {
+    let pkg = PackageJson::from_value(&serde_json::json!({
+        "name": "root", "version": "1.0.0", "overrides": overrides
+    }))
+    .unwrap();
+    let mut graph = DependencyGraph::from_package_json(".".into(), pkg);
+    let root = graph.root_index;
+    let consumer = graph.add_node(PackageNode::from_version_manifest(
+        "consumer".to_string(),
+        "node_modules/consumer".into(),
+        create_version_manifest("consumer", "1.0.0"),
+    ));
+    graph.add_physical_edge(root, consumer);
+    let consumer_edge = graph.add_dependency_edge(root, "consumer", "1.0.0", EdgeType::Prod);
+    graph.mark_dependency_resolved(consumer_edge, consumer);
+    let shared = graph.add_node(PackageNode::from_version_manifest(
+        "shared".to_string(),
+        "node_modules/shared".into(),
+        create_version_manifest("shared", "1.0.0"),
+    ));
+    graph.add_physical_edge(root, shared);
+    let shared_edge = graph.add_dependency_edge(consumer, "shared", "^1.0.0", EdgeType::Prod);
+    if record_target {
+        graph.mark_dependency_resolved(shared_edge, shared);
+        graph.invalidate_dependency(shared_edge);
+        assert!(graph.requires_resolution(shared_edge));
+    }
+    (graph, consumer, shared)
+}
+
+#[test]
+fn only_resolved_global_overrides_reclaim_unused_invalidated_slots() {
+    for (overrides, record_target, still_reachable, can_reclaim) in [
+        (serde_json::json!({ "shared": "2.0.0" }), true, false, true),
+        (
+            serde_json::json!({ "shared": "2.0.0" }),
+            false,
+            false,
+            false,
+        ),
+        (serde_json::json!({ "shared": "2.0.0" }), true, true, false),
+        (
+            serde_json::json!({ "consumer": { "shared": "2.0.0" } }),
+            true,
+            false,
+            false,
+        ),
+        (
+            serde_json::json!({
+                "shared": "2.0.0", "other": { "unrelated": "3.0.0" }
+            }),
+            true,
+            false,
+            false,
+        ),
+    ] {
+        let (mut graph, consumer, shared) =
+            create_shared_revalidation_graph(overrides.clone(), record_target);
+        let root = graph.root_index;
+        if still_reachable {
+            let retained_edge = graph.add_dependency_edge(root, "shared", "1.0.0", EdgeType::Prod);
+            graph.mark_dependency_resolved(retained_edge, shared);
+        }
+        assert_eq!(graph.is_invalidated_target(shared), record_target);
+        assert_eq!(graph.reachable_nodes().contains(&shared), still_reachable);
+        // Before resolution the old node still shadows its ancestor slot.
+        assert_eq!(
+            find_reusable_node(&graph, consumer, "shared", "^1.0.0"),
+            ReuseResult::Install(consumer),
+            "overrides {overrides}, recorded {record_target}, reachable {still_reachable}",
+        );
+
+        let expected = ReuseResult::Install(if can_reclaim { root } else { consumer });
+        let resolved = create_version_manifest("shared", "2.0.0");
+        for final_spec in ["2.0.0", "latest"] {
+            assert_eq!(
+                find_resolved_node(&graph, consumer, "shared", final_spec, &resolved),
+                expected,
+                "final spec {final_spec}, overrides {overrides}, recorded {record_target}, reachable {still_reachable}",
+            );
+        }
+        assert_eq!(
+            find_identical_node(&graph, consumer, "shared", &resolved),
+            expected,
+            "legacy placement: overrides {overrides}, recorded {record_target}, reachable {still_reachable}",
+        );
+    }
+}
+
+#[test]
+fn invalidated_target_remains_reusable_when_final_resolution_matches() {
+    let (graph, consumer, shared) =
+        create_shared_revalidation_graph(serde_json::json!({ "shared": "latest" }), true);
+    let resolved = create_version_manifest("shared", "1.0.0");
+    assert_eq!(
+        find_reusable_node(&graph, consumer, "shared", "^1.0.0"),
+        ReuseResult::Install(consumer),
+    );
+    assert_eq!(
+        find_resolved_node(&graph, consumer, "shared", "latest", &resolved),
+        ReuseResult::Reuse(shared),
+    );
+    assert_eq!(
+        find_identical_node(&graph, consumer, "shared", &resolved),
+        ReuseResult::Reuse(shared),
+    );
 }

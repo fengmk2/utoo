@@ -39,6 +39,9 @@ pub(crate) fn try_reuse_dependency(
     parent: NodeIndex,
     edge: &DependencyEdgeInfo,
 ) -> Option<ProcessResult> {
+    if graph.requires_resolution(edge.edge_id) {
+        return None;
+    }
     match find_reusable_node(graph, parent, &edge.name, &edge.spec) {
         ReuseResult::Reuse(existing_index) => {
             Some(reuse_existing_node(graph, edge, existing_index))

@@ -349,7 +349,12 @@ pub async fn process_dependency<R: ManifestProvider>(
     config: &BuildDepsConfig,
 ) -> Result<ProcessResult, ResolveError<R::Error>> {
     // Find installation location
-    match find_reusable_node(graph, node_index, &edge_info.name, &edge_info.spec) {
+    let location = if graph.requires_resolution(edge_info.edge_id) {
+        ReuseResult::Install(node_index)
+    } else {
+        find_reusable_node(graph, node_index, &edge_info.name, &edge_info.spec)
+    };
+    match location {
         ReuseResult::Reuse(existing_index) => {
             Ok(reuse_existing_node(graph, edge_info, existing_index))
         }
@@ -784,6 +789,7 @@ where
     );
 
     run_main_loop_bfs(graph, registry, &config, receiver).await?;
+    graph.deduplicate_override_subtrees();
 
     // The BFS only builds graph structure; assign all node types in one pass now
     // that the tree is complete, so prod-ness reaches every transitive dep.

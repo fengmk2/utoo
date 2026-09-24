@@ -50,6 +50,42 @@ fn assert_edge_target(graph: &DependencyGraph, edge: &DependencyEdgeInfo, target
 }
 
 #[test]
+fn invalidated_edges_require_resolution_before_reusing_a_matching_target() {
+    let pkg = PackageJson::from_value(&serde_json::json!({
+        "name": "root", "version": "1.0.0",
+        "overrides": { "shared": "1.0.0" }
+    }))
+    .unwrap();
+    let mut graph = DependencyGraph::from_package_json(".".into(), pkg);
+    let root = graph.root_index;
+    let shared = add_package(&mut graph, root, "shared", "1.0.0");
+    let edge = add_shared_edge(&mut graph, root, "^1.0.0");
+    graph.mark_dependency_resolved(edge.edge_id, shared);
+    graph.invalidate_dependency(edge.edge_id);
+
+    // A compatible locked node cannot settle an invalidated requirement until
+    // its new override inputs have been resolved.
+    assert!(graph.requires_resolution(edge.edge_id));
+    assert!(try_reuse_dependency(&mut graph, root, &edge).is_none());
+
+    let resolved = ResolvedDependency {
+        spec: Cow::Borrowed("1.0.0"),
+        manifest: manifest("shared", "1.0.0"),
+    };
+    let result = place_resolved_dependency(
+        &mut graph,
+        root,
+        &edge,
+        &resolved,
+        &BuildDepsConfig::default(),
+    );
+    assert!(matches!(result, ProcessResult::Reused(index) if index == shared));
+    assert!(!graph.requires_resolution(edge.edge_id));
+    assert_eq!(graph.graph.node_count(), 2);
+    assert_edge_target(&graph, &edge, shared);
+}
+
+#[test]
 fn placement_preserves_compatible_range_reuse() {
     let mut graph =
         DependencyGraph::from_package_json(".".into(), PackageJson::new("root", "1.0.0"));
