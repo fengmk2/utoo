@@ -600,7 +600,7 @@ async fn changed_override_keeps_consumers_on_one_module_instance() {
             json!({
                 "name": "root", "version": "1.0.0", "private": true,
                 "dependencies": { "first": "1.0.0", "second": "1.0.0" },
-                "overrides": { "shared": target }
+                "overrides": { "shared": target, "unrelated": { "unused": "2.0.0" } }
             })
             .to_string(),
         )

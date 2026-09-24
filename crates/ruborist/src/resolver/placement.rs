@@ -58,7 +58,12 @@ pub fn process_dependency_with_resolved(
     if let Some(reused) = try_reuse_dependency(graph, node_index, edge_info) {
         return reused;
     }
-    match graph.find_resolved_node(node_index, &edge_info.name, &resolved.manifest) {
+    match graph.find_resolved_node(
+        node_index,
+        &edge_info.name,
+        &edge_info.spec,
+        &resolved.manifest,
+    ) {
         FindResult::Reuse(existing_index) => reuse_existing_node(graph, edge_info, existing_index),
         FindResult::Conflict(conflict_parent) | FindResult::New(conflict_parent) => {
             place_new_node(graph, conflict_parent, edge_info, resolved, config)

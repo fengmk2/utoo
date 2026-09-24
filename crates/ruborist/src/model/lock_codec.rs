@@ -203,18 +203,8 @@ pub fn lock_to_graph(graph: &mut DependencyGraph, lock: &PackageLock, root_path:
                 if edge.valid
                     || !graph.override_names.contains(&edge.name)
                     || !matches_locked_requirement(edge, pkg)
-                    || !graph.override_rules_affect_dependency(
-                        locked_rules,
-                        &edge.name,
-                        &chain,
-                        false,
-                    )
-                    || graph.override_rules_affect_dependency(
-                        &changed_rules,
-                        &edge.name,
-                        &chain,
-                        false,
-                    )
+                    || !graph.override_rules_affect_dependency(locked_rules, edge, &chain, false)
+                    || graph.override_rules_affect_dependency(&changed_rules, edge, &chain, false)
                 {
                     return None;
                 }
@@ -258,12 +248,12 @@ pub fn lock_to_graph(graph: &mut DependencyGraph, lock: &PackageLock, root_path:
             let include_parent_scopes = graph.find_physical_child(node, &edge.name).is_none();
             let affected = graph.override_rules_affect_dependency(
                 &changed_rules,
-                &edge.name,
+                edge,
                 &chain,
                 include_parent_scopes,
             ) || graph.override_rules_affect_dependency(
                 &changed_rules,
-                &edge.name,
+                edge,
                 &previous_chain,
                 include_parent_scopes,
             ) || (chain != previous_chain
@@ -271,12 +261,12 @@ pub fn lock_to_graph(graph: &mut DependencyGraph, lock: &PackageLock, root_path:
                     let rule = std::slice::from_ref(rule);
                     graph.override_rules_affect_dependency(
                         rule,
-                        &edge.name,
+                        edge,
                         &chain,
                         include_parent_scopes,
                     ) != graph.override_rules_affect_dependency(
                         rule,
-                        &edge.name,
+                        edge,
                         &previous_chain,
                         include_parent_scopes,
                     )

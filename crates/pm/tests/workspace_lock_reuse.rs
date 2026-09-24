@@ -282,6 +282,12 @@ fn unchanged_dist_tag_override_preserves_locked_version() {
 #[test]
 fn legacy_lock_preserves_pins_when_override_metadata_is_missing() {
     check_override_lock_pins(
+        json!({ "unrelated@^9.0.0": "9.0.0" }),
+        None,
+        "1.0.0",
+        "1.0.0",
+    );
+    check_override_lock_pins(
         json!({ "shared": "1.0.0", "unrelated@^9": { "inner": "9.0.0" } }),
         None,
         "1.0.0",

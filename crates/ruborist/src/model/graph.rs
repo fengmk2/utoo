@@ -646,7 +646,7 @@ impl DependencyGraph {
 
         // Start with the requester's own node_modules, including nested nodes
         // seeded from a lockfile, before looking in ancestor directories.
-        self.find_in_parent_chain(from, name, false, |child| {
+        self.find_in_parent_chain(from, name, None, |child| {
             let spec = effective_spec.as_str();
             let matches_candidate = |spec: &str| match Protocol::strip_prefix(spec) {
                 // HTTP tarballs are identified by their source URL, not the
@@ -680,13 +680,15 @@ impl DependencyGraph {
 
     /// Find an existing copy of the final manifest after overrides have resolved.
     /// Do not recheck the original spec or apply overrides to the target again.
+    /// The original spec only determines which scopes restrict slot replacement.
     pub(crate) fn find_resolved_node(
         &self,
         from: NodeIndex,
         name: &str,
+        version_spec: &str,
         manifest: &CoreVersionManifest,
     ) -> FindResult {
-        self.find_in_parent_chain(from, name, true, |child| {
+        self.find_in_parent_chain(from, name, Some((version_spec, manifest)), |child| {
             child.manifest.name() == manifest.name
                 && child.version == manifest.version
                 && child
@@ -702,7 +704,7 @@ impl DependencyGraph {
         &self,
         from: NodeIndex,
         name: &str,
-        replace_unused_override_target: bool,
+        replacement: Option<(&str, &CoreVersionManifest)>,
         matches_candidate: impl Fn(&PackageNode) -> bool,
     ) -> FindResult {
         let mut current = from;
@@ -719,14 +721,12 @@ impl DependencyGraph {
                 // A changed global override can vacate a locked slot. Place its
                 // replacement there so sibling consumers can still share it.
                 // Scoped rules need the requester's parent context instead.
-                if replace_unused_override_target
-                    && self
-                        .resolution_required
-                        .values()
-                        .any(|target| *target == Some(child_idx))
-                    && self.overrides.as_ref().is_some_and(|overrides| {
-                        overrides.rules.iter().all(|rule| rule.parent.is_none())
-                    })
+                if replacement.is_some_and(|(spec, manifest)| {
+                    self.can_replace_override_target(from, current, name, spec, manifest)
+                }) && self
+                    .resolution_required
+                    .values()
+                    .any(|target| *target == Some(child_idx))
                     && !self.reachable_nodes().contains(&child_idx)
                 {
                     return FindResult::New(current);
@@ -1074,7 +1074,7 @@ mod tests {
                 FindResult::Conflict(graph.root_index)
             };
             assert_eq!(
-                graph.find_resolved_node(graph.root_index, "shared", &resolved),
+                graph.find_resolved_node(graph.root_index, "shared", "^1.0.0", &resolved),
                 expected,
                 "candidate {name}@{version} from {source:?}",
             );
